@@ -1,0 +1,8 @@
+my_picks_*.csv
+combos_*.csv
+ledger_*.json
+weekly_*.json
+weekly_report_*.md
+sim_cache_*.json
+__pycache__/
+*.pyc
