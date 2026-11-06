@@ -30,6 +30,9 @@ SAMPLE = 2000     # 필터 격자 시뮬레이션: 회차마다 무작위 후보
 CORE_SAMPLE = 150 # 코어 전략 시뮬레이션: 회차마다 만드는 후보 수
 ROUNDS, SPLIT = 300, 200   # 시뮬레이션 회차 수 / 앞 200 = 선택 구간, 뒤 100 = 검증 구간
 ENIGMA_WIN = 100  # 암호키 신뢰도를 계산하는 직전 회차 수
+RECENT = 20       # 순위표에 보여 주는 최근 회차 수 (기존 코드처럼 회차마다 RECENT_TICKETS 장을 뽑아 실제 당첨 횟수·당첨금을 센다)
+RECENT_TICKETS = 50
+RECENT_POOL = 6000   # 필터 전략이 회차마다 50장을 고를 무작위 후보 수(조건을 통과하는 앞쪽 50장을 사용)
 
 GAMES = {
     "kr": {"name": "한국 로또 6/45", "N": 45, "hist": "lotto_history.csv"},
@@ -358,6 +361,10 @@ def simulate(game, seed=2026):
     win_marg = [Counter() for _ in range(6)]   # 실제 당첨번호의 특징 분포 (회차마다 그 회차 직전 자료로 계산)
     core_res = {s[0]: [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]] for s in CORE_STRATEGIES}   # [구간][장수, 5등+, 4등+, 3등+, 당첨금]
     core_rr = {s[0]: [[], []] for s in CORE_STRATEGIES}
+    core_sz = {s[0]: [] for s in CORE_STRATEGIES}   # 회차별 코어(풀) 번호 개수: 코어가 너무 작으면 장끼리 비슷해져 추천에서 뺀다
+    rng2 = random.Random(seed + 1)
+    recent_pool = []      # 최근 RECENT 회차: (후보 [(특징, 등수)], 그 회차 등수별 1인당 당첨금)
+    core_recent = {s[0]: {"n": 0, "c": [0] * 6, "money": 0} for s in CORE_STRATEGIES}
     for k, i in enumerate(range(len(d) - ROUNDS, len(d))):
         part = 0 if k < SPLIT else 1
         ctx = context(d, i)
@@ -365,6 +372,12 @@ def simulate(game, seed=2026):
         tbl = agg[part]
         for dim, v in enumerate(feat(win, ctx)):
             win_marg[dim][v] += 1
+        if k >= ROUNDS - RECENT:
+            pl = []
+            for _ in range(RECENT_POOL):
+                c = tuple(sorted(rng2.sample(range(1, N + 1), 6)))
+                pl.append((feat(c, ctx), rank_of(c, win, bonus)))
+            recent_pool.append((pl, amt))
         for _ in range(SAMPLE):
             c = tuple(sorted(rng.sample(range(1, N + 1), 6)))
             e = tbl.setdefault(feat(c, ctx), [0] * 7)
@@ -378,8 +391,16 @@ def simulate(game, seed=2026):
         for sid, _, mode, _spec, picks in CORE_STRATEGIES:
             x = core_res[sid][part]
             n0, h0 = x[0], x[1]
-            for c in core_tickets(game, core_of(game, sid, i, memo), ctx, band, CORE_SAMPLE, rng, mode, picks=picks):
+            core = core_of(game, sid, i, memo)
+            core_sz[sid].append(len(core))
+            for ti, c in enumerate(core_tickets(game, core, ctx, band, CORE_SAMPLE, rng, mode, picks=picks)):
                 r = rank_of(c, win, bonus)
+                if k >= ROUNDS - RECENT and ti < RECENT_TICKETS:
+                    cr = core_recent[sid]
+                    cr["n"] += 1
+                    cr["c"][r] += 1
+                    if r and amt:
+                        cr["money"] += amt[r - 1]
                 x[0] += 1
                 x[1] += r > 0
                 x[2] += 0 < r <= 4
@@ -389,7 +410,27 @@ def simulate(game, seed=2026):
                 core_rr[sid][part].append([x[0] - n0, x[1] - h0])   # 회차별 (장수, 5등+ 장수): 코어 전략은 장끼리 번호를 공유해 결과가 함께 움직이므로 z 를 회차 단위로 계산한다
         if (k + 1) % 50 == 0:
             print(f"    시뮬레이션 {k + 1}/{ROUNDS} 회차 …")
-    return agg, core_res, win_marg, core_rr
+    return agg, core_res, win_marg, core_rr, core_sz, recent_pool, core_recent
+
+
+def recent_eval(recent_pool, opts):
+    """최근 RECENT 회차에서, 회차마다 조건을 통과하는 후보 앞쪽 RECENT_TICKETS 장을 골랐을 때의 장수·등수별 횟수(1~5등)·당첨금."""
+    n, c, money = 0, [0] * 6, 0
+    for pl, amt in recent_pool:
+        got = 0
+        for f, rk in pl:
+            if passes(f, opts):
+                got += 1
+                c[rk] += 1
+                if rk and amt:
+                    money += amt[rk - 1]
+                if got == RECENT_TICKETS:
+                    break
+        n += got
+    return {"n": n, "c": c[1:], "money": money}
+
+
+SCHEMA = 4   # 캐시 형식 번호(필터 전략 ID 를 격자 번호로 고정, 코어 크기 기록)
 
 
 def build_table(game):
@@ -398,12 +439,12 @@ def build_table(game):
     if os.path.exists(game.cache):
         try:
             c = json.load(open(game.cache, encoding="utf-8"))
-            if c.get("last") == last and c.get("v") == VERSION:
+            if c.get("last") == last and c.get("v") == VERSION and c.get("schema") == SCHEMA:
                 return c["rows"]
         except Exception:
             pass
     print(f"  {game.name}: 전략을 과거 {ROUNDS}회로 시뮬레이션합니다 (약 1~2분, 이번 회차 동안 저장됩니다).")
-    agg, core_res, win_marg, core_rr = simulate(game)
+    agg, core_res, win_marg, core_rr, core_sz, recent_pool, core_recent = simulate(game)
     rnd_marg = [Counter() for _ in range(6)]
     for tbl in agg:
         for f, e in tbl.items():
@@ -411,18 +452,25 @@ def build_table(game):
                 rnd_marg[dim][v] += e[0]
     signals = {"win": [{str(k): c for k, c in m.items()} for m in win_marg], "rnd": [{str(k): c for k, c in m.items()} for m in rnd_marg]}
     fr = [eval_filters(agg[0]), eval_filters(agg[1])]
-    rows, seen = [], set()
+    rows, seen = [], {}
+    gid = {tuple(o): i + 1 for i, (o, _) in enumerate(filter_grid())}   # 전략 ID 는 격자 번호로 고정(회차가 바뀌어도 같은 필터 = 같은 ID)
     for opts, name in sorted(filter_grid(), key=lambda x: sum(o is not None for o in x[0])):
         s, v = fr[0][tuple(opts)], fr[1][tuple(opts)]
-        if s[0] < 20000 or v[0] < 10000 or (s, v) in seen:   # 통과 후보가 너무 적거나 결과가 같은 전략은 가장 단순한 하나만
+        if s[0] < 20000 or v[0] < 10000:   # 통과 후보가 너무 적은 전략은 제외
             continue
-        seen.add((s, v))
-        rows.append({"id": "F" + str(len(rows) + 1), "name": name, "kind": "F", "opts": [list(o) if o else None for o in opts],
-                     "sel": [s[0], s[1], s[2], 0, s[3]], "ver": [v[0], v[1], v[2], 0, v[3]]})
+        key = (s[1], v[1])                 # 적중 횟수가 같고 통과 장수도 2% 이내로 같으면 사실상 같은 전략(예: AC 7~15 는 거의 모든 후보를 통과) → 가장 단순한 하나만
+        if any(abs(n - s[0]) <= 0.02 * s[0] for n in seen.get(key, [])):
+            continue
+        seen.setdefault(key, []).append(s[0])
+        rows.append({"id": "F" + str(gid[tuple(opts)]), "name": name, "kind": "F", "opts": [list(o) if o else None for o in opts],
+                     "sel": [s[0], s[1], s[2], 0, s[3]], "ver": [v[0], v[1], v[2], 0, v[3]], "rec": recent_eval(recent_pool, opts)})
     for sid, name, mode, spec, picks in CORE_STRATEGIES:
         if core_res[sid][0][0] >= 5000 and core_res[sid][1][0] >= 2500:   # 조건을 만족하는 후보를 거의 못 만든 코어 전략은 제외
-            rows.append({"id": sid, "name": name, "kind": sid[0], "opts": None, "sel": core_res[sid][0], "ver": core_res[sid][1], "rr": core_rr[sid]})
-    json.dump({"last": last, "v": VERSION, "rows": rows, "signals": signals}, open(game.cache, "w", encoding="utf-8"), ensure_ascii=False)
+            sz = core_sz[sid]
+            rows.append({"id": sid, "name": name, "kind": sid[0], "opts": None, "sel": core_res[sid][0], "ver": core_res[sid][1], "rr": core_rr[sid],
+                         "core_n": sum(sz) / len(sz) if sz else 0,
+                         "rec": {"n": core_recent[sid]["n"], "c": core_recent[sid]["c"][1:], "money": core_recent[sid]["money"]}})
+    json.dump({"last": last, "v": VERSION, "schema": SCHEMA, "rows": rows, "signals": signals}, open(game.cache, "w", encoding="utf-8"), ensure_ascii=False)
     return rows
 
 
@@ -431,37 +479,113 @@ def zscore(hits, n, p):
     return (hits - n * p) / sd if sd else 0.0
 
 
-def row_z(row, part, p5):
-    """z: 필터 전략은 후보 장 단위, 코어·풀 전략은 회차 단위로 계산한다(같은 회차의 장끼리 번호를 공유해 결과가 함께 움직이기 때문)."""
+def base_row(rows):
+    return next(r for r in rows if r["name"].startswith("필터 없음"))
+
+
+def row_z(row, part, p5, base=None):
+    """z: ① 필터 전략은 '같은 후보 표본에서 필터 없이 뽑은 무작위'의 적중률을 기준으로(표본이 우연히 운 좋았던 부분을 함께 상쇄) 후보 장 단위로,
+    ② 코어·풀 전략은 무작위 기대 p5 를 기준으로 회차 단위로 계산한다(같은 회차의 장끼리 번호를 공유해 결과가 함께 움직이기 때문)."""
     rr = row.get("rr")
     if rr and len(rr[part]) >= 5:
         rates = [h / n for n, h in rr[part] if n]
         m = sum(rates) / len(rates)
         sd = (sum((x - m) ** 2 for x in rates) / (len(rates) - 1)) ** 0.5
         return (m - p5) / (sd / len(rates) ** 0.5) if sd else 0.0
-    c = row["sel" if part == 0 else "ver"]
-    return zscore(c[1], c[0], p5)
+    k = "sel" if part == 0 else "ver"
+    q = p5
+    if base is not None and row is not base:
+        q = base[k][1] / max(base[k][0], 1)
+    return zscore(row[k][1], row[k][0], q)
 
 
-def show_table(game, rows, key, top=15):
+def pooled_z(row, base, p5):
+    """선택·검증 300회를 합친 z (필터 전략은 같은 표본의 무작위 대비, 코어 전략은 무작위 기대 대비 회차 단위)."""
+    rr = row.get("rr")
+    if rr and len(rr[0]) + len(rr[1]) >= 10:
+        rates = [h / n for part in rr for n, h in part if n]
+        m = sum(rates) / len(rates)
+        sd = (sum((x - m) ** 2 for x in rates) / (len(rates) - 1)) ** 0.5
+        return (m - p5) / (sd / len(rates) ** 0.5) if sd else 0.0
+    n = row["sel"][0] + row["ver"][0]
+    q = (base["sel"][1] + base["ver"][1]) / max(base["sel"][0] + base["ver"][0], 1)
+    return zscore(row["sel"][1] + row["ver"][1], n, q)
+
+
+def score_of(row, base, p5):
+    """추천 점수 = (선택+검증 합산 5등+률 − 기준 적중률) − 1 표준오차. 표본이 작거나 회차마다 들쭉날쭉한 전략이 위로 올라오지 않게 한다.
+    기준: 필터 전략은 같은 표본의 무작위, 코어·풀 전략은 무작위 기대(p5)."""
+    rr = row.get("rr")
+    if rr and len(rr[0]) + len(rr[1]) >= 10:
+        rates = [h / n for part in rr for n, h in part if n]
+        m = sum(rates) / len(rates)
+        sd = (sum((x - m) ** 2 for x in rates) / (len(rates) - 1)) ** 0.5
+        return m - p5 - sd / len(rates) ** 0.5
+    n = row["sel"][0] + row["ver"][0]
+    m = (row["sel"][1] + row["ver"][1]) / max(n, 1)
+    ref = (base["sel"][1] + base["ver"][1]) / max(base["sel"][0] + base["ver"][0], 1)
+    return m - ref - (m * (1 - m) / max(n, 1)) ** 0.5
+
+
+def eligible(row):
+    """추천 대상: 필터 전략, 또는 코어(풀)가 6개 이상이라 장끼리 충분히 달라지는 코어 전략"""
+    return row["kind"] == "F" or row.get("core_n", 0) >= 6
+
+
+def recommended(rows, p5):
+    base = base_row(rows)
+    pool = [r for r in rows if r is not base and eligible(r) and r["sel"][0] >= 5000 and r["ver"][0] >= 2500]
+    return max(pool, key=lambda r: score_of(r, base, p5)) if pool else base
+
+
+def rec_hits(r):
+    return sum(r["rec"]["c"]) if r.get("rec") else 0
+
+
+def recent_best(rows):
+    """최근 RECENT 회차에서 당첨 횟수(5등 이상)가 가장 많은 전략(같으면 당첨금이 큰 것). 코어 번호가 너무 적은 코어 전략은 뺀다."""
+    base = base_row(rows)
+    pool = [r for r in rows if r is not base and eligible(r) and r.get("rec") and r["sel"][0] >= 5000 and r["ver"][0] >= 2500]
+    return max(pool, key=lambda r: (rec_hits(r), r["rec"]["money"])) if pool else base
+
+
+def show_table(game, rows, key, top=30):
     p5 = p5_of(game.N)
     rate = lambda r, k: r[k][1] / max(r[k][0], 1)
-    keys = {"1": ("5등 이상 적중률", lambda r: rate(r, "sel")), "2": ("4등 이상 적중률", lambda r: r["sel"][2] / max(r["sel"][0], 1)),
-            "3": ("장당 당첨금", lambda r: r["sel"][4] / max(r["sel"][0], 1)),
-            "4": ("전체 300회 합산 5등 이상 적중률", lambda r: (r["sel"][1] + r["ver"][1]) / max(r["sel"][0] + r["ver"][0], 1))}
-    title, fn = keys[key]
     rows = [r for r in rows if r["sel"][0] >= 5000 and r["ver"][0] >= 2500]
-    best = sorted(rows, key=fn, reverse=True)[:top]
-    base = next(r for r in rows if r["name"].startswith("필터 없음"))
+    base = base_row(rows)
+    keys = {"1": ("300회 중 순위 구간 5등 이상 적중률", lambda r: rate(r, "sel")), "2": ("순위 구간 4등 이상 적중률", lambda r: r["sel"][2] / max(r["sel"][0], 1)),
+            "3": ("순위 구간 장당 당첨금", lambda r: r["sel"][4] / max(r["sel"][0], 1)),
+            "4": ("300회 합산 5등 이상 적중률", lambda r: (r["sel"][1] + r["ver"][1]) / max(r["sel"][0] + r["ver"][0], 1)),
+            "5": ("추천 점수 (300회 합산 5등+률 − 무작위 − 1 표준오차)", lambda r: score_of(r, base, p5) if r is not base else -1),
+            "6": (f"최근 {RECENT}회 당첨 횟수 (5등 이상, 같으면 당첨금)", lambda r: (rec_hits(r), r["rec"]["money"]) if r is not base else (-1, 0)),
+            "7": (f"최근 {RECENT}회 당첨금", lambda r: r["rec"]["money"] if r is not base else -1)}
+    title, fn = keys[key]
+    best, seen = [], set()
+    for r in sorted(rows, key=fn, reverse=True):   # 최근 20회 결과가 똑같은(같은 후보를 고른) 전략은 필터가 가장 단순한 하나만 보여 준다
+        sig = (tuple(r["rec"]["c"]), r["rec"]["money"]) if r.get("rec") and r["kind"] == "F" and r is not base else None
+        if sig is not None and sig in seen:
+            continue
+        if sig is not None:
+            seen.add(sig)
+        best.append(r)
+        if len(best) == top:
+            break
     money = game.key == "kr"
-    print(f"\n  [시뮬레이션 순위] {game.name} · 기준: {title} (선택 구간 {SPLIT}회 → 검증 구간 {ROUNDS - SPLIT}회)")
-    print(f"  {'ID':>4} {'전략':<46}{'5등+률':>8}{'z':>6}{'장당금':>8} | {'검증 5등+률':>11}{'z':>6}{'장당금':>8}")
+    star, diamond = recent_best(rows), recommended(rows, p5)
+    print(f"\n  [시뮬레이션 순위] {game.name} · 정렬: {title}")
+    print(f"  ※ 최근 {RECENT}회 = 회차마다 {RECENT_TICKETS}장씩 뽑아 실제 당첨번호로 채점({RECENT * RECENT_TICKETS:,}장) · 300회 = 과거 300회 시뮬레이션(순위 구간 {SPLIT}회 → 검증 구간 {ROUNDS - SPLIT}회)")
+    print(f"  {'ID':>6}  {'전략':<40}| {'당첨':>4}{'5등':>4}{'4등':>4}{'3등':>4}{'1·2등':>6}{'당첨금(원)':>13} | {'300회 5등+률 순위→검증':>22}{'점수':>7}")
     for r in [base] + best:
-        s, v = r["sel"], r["ver"]
-        sm = f"{s[4] / max(s[0], 1):>8.0f}" if money else f"{'-':>8}"
-        vm = f"{v[4] / max(v[0], 1):>8.0f}" if money else f"{'-':>8}"
-        print(f"  {r['id']:>4} {r['name'][:44]:<46}{rate(r, 'sel'):>8.2%}{row_z(r, 0, p5):>6.1f}{sm} | {rate(r, 'ver'):>11.2%}{row_z(r, 1, p5):>6.1f}{vm}")
-    print(f"  (무작위 기대 5등+률 {p5:.2%}" + (", 장당 당첨금(3~5등만) 약 220원" if money else ", 뉴욕은 당첨금 자료가 없어 횟수만 표시") + ". z=무작위 대비 표준편차 배수: 전략 수백 개 중 1등이 3~4 나오는 것은 우연으로 설명됩니다)")
+        rc = r["rec"]["c"] if r.get("rec") else [0] * 5
+        mon = f"{r['rec']['money']:>13,}" if money and r.get("rec") else f"{'-':>13}"
+        sc_ = f"{score_of(r, base, p5) * 100:>+7.2f}" if r is not base else f"{'-':>7}"
+        mark = "★" if r is star else "◆" if r is diamond else " "
+        print(f"  {r['id']:>6}{mark} {r['name'][:39]:<40}| {sum(rc):>4}{rc[4]:>4}{rc[3]:>4}{rc[2]:>4}{rc[0] + rc[1]:>6}{mon} | {rate(r, 'sel'):>10.2%} →{rate(r, 'ver'):>8.2%}{sc_}")
+    exp = RECENT * RECENT_TICKETS * p5
+    print(f"  ★ = 최근 {RECENT}회 당첨 횟수 1위(추천 r) · ◆ = 300회 합산 추천 점수 1위(안정 추천 s). 코어 번호가 6개 미만인 코어 전략은 장끼리 너무 비슷해 추천에서 뺍니다.")
+    print(f"  (무작위로 {RECENT * RECENT_TICKETS:,}장을 뽑으면 5등 이상은 평균 약 {exp:.0f}회" + (", 장당 당첨금(3~5등) 약 220원" if money else ", 뉴욕은 당첨금 자료가 없어 횟수만 표시") +
+          f". {RECENT}회는 표본이 작아 우연의 범위가 크고(표준편차 약 {(exp * (1 - p5)) ** 0.5:.0f}회), 필터 전략의 {RECENT}회 성적은 후보 표본에서 환산한 값입니다)")
     return best
 
 
@@ -670,7 +794,7 @@ def settle_picks(game, led):
             t = tuple(int(x) for x in r["ticket"].split("-"))
             win, bonus, amt = res[rd]
             rk = rank_of(t, win, bonus)
-            e = led["oos"].setdefault(r["strategy_id"], {"name": r["strategy_name"], "n": 0, "h5": 0, "hits": 0, "money": 0, "weeks": {}})
+            e = led["oos"].setdefault(r["strategy_name"], {"id": r["strategy_id"], "name": r["strategy_name"], "n": 0, "h5": 0, "hits": 0, "money": 0, "weeks": {}})   # 이름으로 묶는다(ID 는 바뀔 수 있음)
             e["n"] += 1
             e["h5"] += rk > 0
             e["hits"] += len(set(t) & set(win))
@@ -690,32 +814,43 @@ def settle_picks(game, led):
 
 
 def update_status(game, rows, led):
-    """부진한 전략 정리 규칙. ① 검증 구간 z ≤ -2.5 이고 합산 5등+률이 무작위보다 낮으면 '퇴출'  ② 진짜 미래 누적(저장한 번호)이 장 2,000개 이상이고 z ≤ -2 이면 '퇴출'.
+    """부진한 전략 정리 규칙. ① 300회 합산 z ≤ -2.5 이고 검증 구간도 무작위보다 낮으면 '퇴출'  ② 진짜 미래 누적(저장한 번호)이 장 2,000개 이상이고 z ≤ -2 이면 '퇴출'.
     퇴출된 전략은 순위표와 추천에서 숨긴다(기록은 남김). 규칙이 까다로운 이유: 무작위 결과로 전략을 쉽게 버리면 그것도 우연에 속는 것이기 때문."""
     p5 = p5_of(game.N)
-    base = next(r for r in rows if r["name"].startswith("필터 없음"))
+    base = base_row(rows)
     brate = (base["sel"][1] + base["ver"][1]) / (base["sel"][0] + base["ver"][0])
     changes = []
     for r in rows:
         if r is base:
             continue
-        zv = row_z(r, 1, p5)
+        zp = pooled_z(r, base, p5)
+        zv = row_z(r, 1, p5, base)
         rate = (r["sel"][1] + r["ver"][1]) / max(r["sel"][0] + r["ver"][0], 1)
         reason = None
-        if zv <= -2.5 and rate < brate:
-            reason = f"검증 구간 z {zv:.1f}, 합산 5등+률 {rate:.2%} < 무작위 {brate:.2%}"
-        o = led["oos"].get(r["id"])
+        if zp <= -2.5 and zv < 0 and rate < brate:   # 300회 합산 z ≤ -2.5 이고 검증 구간도 무작위보다 낮은 전략
+            reason = f"300회 합산 z {zp:.1f}, 검증 z {zv:.1f}, 합산 5등+률 {rate:.2%} < 무작위 {brate:.2%}"
+        o = led["oos"].get(r["name"])
         if o and o["n"] >= 2000 and zscore(o["h5"], o["n"], p5) <= -2:
             reason = f"미래 누적 {o['n']}장 z {zscore(o['h5'], o['n'], p5):.1f}"
-        st = led["status"].get(r["id"])
-        if reason and not st:
-            led["status"][r["id"]] = {"state": "퇴출", "since": game.draws[-1][0], "name": r["name"], "reason": reason}
+        if reason and r["name"] not in led["status"]:   # 퇴출 기록은 전략 이름(필터 조건)으로 남긴다: ID 가 바뀌어도 같은 전략으로 인식
+            led["status"][r["name"]] = {"state": "퇴출", "since": game.draws[-1][0], "id": r["id"], "reason": reason}
             changes.append((r["id"], r["name"], reason))
     return changes
 
 
+def summarize_changes(changes):
+    """새로 퇴출된 전략이 많을 때 한 줄 요약 + 가장 나쁜 5개만 보여 준다."""
+    if not changes:
+        return
+    tokens = Counter(t for _, name, _ in changes for t in name.split(" + "))
+    print(f"  퇴출: 새로 {len(changes)}개. 가장 많이 겹친 필터: " + ", ".join(f"{t}({c}개)" for t, c in tokens.most_common(4)))
+    for rid, name, reason in sorted(changes, key=lambda x: float(x[2].split("z ")[1].split(",")[0].split(" ")[0]))[:5]:
+        print(f"    {rid} {name[:44]} — {reason}")
+    print("    (나머지와 사유는 ledger 파일에 기록됩니다)")
+
+
 def active_rows(game, rows, led):
-    return [r for r in rows if led["status"].get(r["id"], {}).get("state") != "퇴출" and r["sel"][0] >= 5000 and r["ver"][0] >= 2500]
+    return [r for r in rows if led["status"].get(r["name"], {}).get("state") != "퇴출" and r["sel"][0] >= 5000 and r["ver"][0] >= 2500]
 
 
 def replay_week(game, rows, weeks=4, n=40):
@@ -723,7 +858,7 @@ def replay_week(game, rows, weeks=4, n=40):
     d = game.draws
     targets = [len(d) - 1 - w for w in range(weeks)]
     base = next(r for r in rows if r["name"].startswith("필터 없음"))
-    best = sorted(rows, key=lambda r: (r["sel"][1] + r["ver"][1]) / max(r["sel"][0] + r["ver"][0], 1), reverse=True)[:8]
+    best = sorted([r for r in rows if r is not base and eligible(r)], key=lambda r: score_of(r, base, p5_of(game.N)), reverse=True)[:8]
     ids = {r["id"]: r for r in [base] + best + [r for r in rows if r["kind"] != "F"]}
     out = {}
     for rid, row in ids.items():
@@ -765,26 +900,25 @@ def weekly(game, rows, picks_per=5):
     print("\n  [2] 진짜 미래 성적 누적 — 추첨 전에 저장해 둔 번호를 추첨 뒤 채점한 기록")
     if oos:
         print(f"  {'ID':>4} {'전략':<44}{'장수':>6}{'평균 맞힘':>9}{'5등+':>6}{'기대':>6}{'당첨금':>10}")
-        for rid, e in oos.items():
+        for _name, e in oos.items():
+            rid = e.get("id", "")
             print(f"  {rid:>4} {e['name'][:42]:<44}{e['n']:>6}{e['hits'] / e['n']:>9.2f}{e['h5']:>6}{e['n'] * p5:>6.1f}{e['money']:>10,}")
     else:
         print("  아직 없습니다. 이번 주 추천 번호를 저장해 두었으니 추첨 뒤 다음 주 분석부터 쌓입니다.")
     print("\n  [3] 부진한 전략 정리와 보완")
     if changes:
-        tokens = Counter(t for _, name, _ in changes for t in name.split(" + "))
-        print(f"   이번 주 새로 퇴출된 전략 {len(changes)}개. 가장 많이 겹친 필터: " + ", ".join(f"{t}({c}개)" for t, c in tokens.most_common(4)))
-        for rid, name, reason in sorted(changes, key=lambda x: float(x[2].split("z ")[1].split(",")[0]))[:5]:
-            print(f"   퇴출  {rid} {name[:40]} — {reason}")
-        print("   (나머지는 ledger 파일에 사유와 함께 기록됩니다)")
+        summarize_changes(changes)
     else:
-        print("   이번 주 새로 퇴출된 전략: 없음 (기준: 검증 구간 z ≤ -2.5 이고 무작위보다 낮음 / 미래 누적 2,000장 이상에서 z ≤ -2)")
-    gone = [f"{k}({v['name'][:20]})" for k, v in led["status"].items()]
+        print("   이번 주 새로 퇴출된 전략: 없음 (기준: 300회 합산 z ≤ -2.5 이고 검증 구간도 무작위보다 낮음 / 미래 누적 2,000장 이상에서 z ≤ -2)")
+    gone = [f"{v.get('id', '')}({k[:20]})" for k, v in led["status"].items()]
     print(f"   현재 퇴출 목록: {', '.join(gone) if gone else '없음'}")
     for rid, what in NEW_IN_VERSION.items():
         print(f"   이번 버전 보완: {rid} {what}")
     # 이번 주 추천: 합산 5등+률 상위 3개 + 대표 전략, 번호를 저장해 미래 성적으로 쌓는다
-    rank = sorted(act, key=lambda r: (r["sel"][1] + r["ver"][1]) / max(r["sel"][0] + r["ver"][0], 1), reverse=True)
-    picks = [rank[0], rank[1], rank[2]]
+    p5_ = p5_of(game.N)
+    rank = sorted([r for r in act if r is not base and eligible(r)], key=lambda r: score_of(r, base, p5_), reverse=True)
+    star = recent_best(act)
+    picks = [star] + [r for r in rank if r is not star][:2]   # ★ 최근 20회 당첨 1위 + 300회 합산 추천 점수 상위 2개
     ids = {r["id"]: r for r in act}
     for rid in ("E1", "A1", "P1", base["id"]):
         if rid in ids and ids[rid] not in picks:
@@ -827,7 +961,7 @@ def ask(msg, default):
 
 def pick_numbers(game, rows, best):
     by_id = {r["id"].upper(): r for r in rows}
-    print("\n  전략을 고르세요.  [ID] 순위표의 ID (예: F12, E1, A1)   [r] 추천(순위표 1위)   [c] 직접 필터 만들기   [p] 받아 온 25수 풀 안에서 고르기")
+    print("\n  전략을 고르세요.  [ID] 순위표의 ID (예: F12, E1, A1)   [r] 추천(★ 최근 20회 당첨 1위)   [s] 안정 추천(◆)   [c] 직접 필터 만들기   [p] 받아 온 25수 풀 안에서 고르기")
     ch = ask("선택", "r")
     if ch.lower() == "p":
         nums = [int(x) for x in input(f"  풀 번호를 쉼표나 띄어쓰기로 입력 ({pool_size(game)}개 권장): ").replace(",", " ").split()]
@@ -857,7 +991,7 @@ def pick_numbers(game, rows, best):
         opts = [rng_in(n) for n in LAB]
         row = {"id": "C", "kind": "F", "opts": opts, "name": "직접 선택: " + (" + ".join(x for x in [tag(n, tuple(o) if o else None) for n, o in zip(LAB, opts)] if x) or "필터 없음")}
     else:
-        row = best[0] if ch.lower() == "r" else by_id.get(ch.upper())
+        row = recent_best(rows) if ch.lower() == "r" else recommended(rows, p5_of(game.N)) if ch.lower() == "s" else by_id.get(ch.upper())
         if not row:
             print("  순위표에 없는 ID 입니다.")
             return
@@ -903,14 +1037,13 @@ def main():
         pool_report(game)
         return
     led = load_ledger(game)
-    for rid, name, reason in update_status(game, all_rows, led):
-        print(f"  퇴출: {rid} {name[:40]} — {reason}")
+    summarize_changes(update_status(game, all_rows, led))
     save_ledger(game, led)
     rows = active_rows(game, all_rows, led)
     if len(rows) < len(all_rows):
         print(f"  (퇴출된 전략 {len(led['status'])}개는 순위표에서 숨김. 목록은 ledger_{game.key}.json)")
     show_ciphers(game)
-    key_sort = "1"
+    key_sort = "6"
     best = show_table(game, rows, key_sort)
     while True:
         print("\n  [1] 번호 뽑기   [2] 순위표 기준   [3] 최신 당첨번호 받기   [4] 저장한 번호 결과   [5] 암호키 신뢰도   [6] 신호 분석   [7] 주간 분석(금요일)   [8] 25수 풀 분석   [0] 끝내기")
@@ -920,8 +1053,8 @@ def main():
         if m == "1":
             pick_numbers(game, rows, best)
         elif m == "2":
-            key_sort = ask("기준  1=5등 이상 적중률  2=4등 이상  3=장당 당첨금  4=전체 300회 합산", key_sort)
-            best = show_table(game, rows, key_sort if key_sort in "1234" else "1")
+            key_sort = ask("기준  1=5등 이상 적중률  2=4등 이상  3=장당 당첨금  4=전체 300회 합산  5=추천 점수  6=최근 20회 당첨 횟수  7=최근 20회 당첨금", key_sort)
+            best = show_table(game, rows, key_sort if key_sort in "1234567" else "6")
         elif m == "3":
             game.update()
             all_rows = build_table(game)
