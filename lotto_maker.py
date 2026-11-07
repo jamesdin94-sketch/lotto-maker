@@ -623,7 +623,8 @@ def show_table(game, rows, key, top=30):
     print(f"  * '최근 {RECENT}회' = 최근 {RECENT}번의 추첨마다 그 전략으로 {RECENT_TICKETS}장씩({RECENT * RECENT_TICKETS:,}장) 뽑아 실제 당첨번호와 맞춰 본 결과입니다.")
     print(f"  * 맨 왼쪽 '번호'를 기억했다가 아래 메뉴 1(번호 뽑기)에서 그 번호를 입력하면 됩니다.")
     print("  " + padl("번호", 4) + "  " + padr("전략(조건)", 30) + "| " + padl("당첨", 4) + padl("5등", 5) + padl("4등", 5) + padl("3등", 5) + padl("1,2등", 6) + padl("당첨금(원)", 12) + " | " + padr("300회(앞/뒤)", 13) + padl("점수", 6))
-    shown = [base] + best
+    extras = sorted([r for r in rows if r["kind"] in ("E", "A", "P") and r not in best], key=lambda r: (r["kind"] != "E", r["kind"], int(r["id"][1:])))   # 암호키·AI·25수 풀 전략은 순위와 상관없이 항상 보여 준다
+    shown = [base] + best + extras
 
     def line(n_, mark, r):
         rc = r["rec"]["c"] if r.get("rec") else [0] * 5
@@ -633,6 +634,8 @@ def show_table(game, rows, key, top=30):
         return ("  " + padl(str(n_), 4) + mark + " " + padr(cut(nm, 30), 30) + "| " + padl(str(sum(rc)), 4) + padl(str(rc[4]), 5) + padl(str(rc[3]), 5) + padl(str(rc[2]), 5) + padl(str(rc[0] + rc[1]), 6)
                 + padl(mon, 12) + " | " + padr(f"{rate(r, 'sel') * 100:.2f}/{rate(r, 'ver') * 100:.2f}", 13) + padl(sc_, 6))
     for n, r in enumerate(shown):
+        if extras and r is extras[0]:
+            print("  --- 암호키(애니그마)·AI·25수 풀 전략 (순위와 상관없이 항상 표시. 번호로 고르는 방법은 위와 같음) ---")
         print(line(n, "*" if r is star else "@" if r is diamond else " ", r))
     for mk, r, how in (("*", star, 2), ("@", diamond, 3)):   # 정렬 때문에 목록에 없는 * · @ 전략도 아래에 보여 준다(메뉴 1 -> 2 또는 3 으로 선택)
         if r not in shown:
