@@ -21,10 +21,11 @@ import unicodedata
 import urllib.request
 import zlib
 from collections import Counter
+from datetime import datetime
 from itertools import combinations
 from math import comb
 
-VERSION = "1.2"   # 구조가 바뀌면 앞자리(2.0), 전략·수치만 바뀌면 소수점(1.1). CHANGELOG.md 참고
+VERSION = "1.3"   # 구조가 바뀌면 앞자리(2.0), 전략·수치만 바뀌면 소수점(1.1). CHANGELOG.md 참고
 HERE = os.path.dirname(os.path.abspath(__file__))
 W = 10            # '최근' = 직전 10회
 SAMPLE = 2000     # 필터 격자 시뮬레이션: 회차마다 무작위 후보 수
@@ -723,19 +724,75 @@ def show_tickets(tickets, ctx, core=None):
 
 
 # ---------------------------------------------------------------- 주간 기록: 저장 → 결과 확인
+PICK_HEAD = ["target_round", "strategy_id", "strategy_name", "ticket", "save_id", "saved_at"]
+
+
+def read_picks(game):
+    """저장 파일을 읽는다. 예전 형식(4열)은 save_id 를 1 로 본다."""
+    if not os.path.exists(game.picks):
+        return []
+    with open(game.picks, encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r.setdefault("save_id", None)
+        r["save_id"] = r.get("save_id") or "1"
+        r["saved_at"] = r.get("saved_at") or ""
+    return rows
+
+
 def save_picks(game, target, sid, name, tickets):
-    new = not os.path.exists(game.picks)
-    with open(game.picks, "a", newline="", encoding="utf-8") as f:
+    """번호를 저장한다. 같은 회차에 여러 번 저장하면 저장 번호(save_id)가 2, 3 … 으로 올라가고, 결과 확인에서 저장 묶음별로 따로 채점한다."""
+    rows = read_picks(game)
+    ids = {int(r["save_id"]) for r in rows if int(r["target_round"]) == target and str(r["save_id"]).isdigit()}
+    save_id = max(ids) + 1 if ids else 1
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for t in tickets:
+        rows.append({"target_round": str(target), "strategy_id": sid, "strategy_name": name, "ticket": "-".join(map(str, t)), "save_id": str(save_id), "saved_at": stamp})
+    tmp = game.picks + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:   # 임시 파일에 다 쓴 뒤 바꿔 끼워, 도중에 끊겨도 기존 기록이 남게 한다
         w = csv.writer(f)
-        if new:
-            w.writerow(["target_round", "strategy_id", "strategy_name", "ticket"])
-        for t in tickets:
-            w.writerow([target, sid, name, "-".join(map(str, t))])
-    with open(os.path.join(HERE, f"combos_{game.key}_{target}.csv"), "w", newline="", encoding="utf-8") as f:   # 기존 코드처럼 구매용 CSV 도 남긴다
-        w = csv.writer(f)
-        w.writerow(["순번", "전략", "n1", "n2", "n3", "n4", "n5", "n6"])
-        for i, t in enumerate(tickets, 1):
-            w.writerow([i, name, *t])
+        w.writerow(PICK_HEAD)
+        for r in rows:
+            w.writerow([r[k] for k in PICK_HEAD])
+    os.replace(tmp, game.picks)
+    for fn in (f"combos_{game.key}_{target}.csv", f"combos_{game.key}_{target}_save{save_id}.csv"):   # 마지막 저장본과 저장 번호별 사본을 남긴다
+        with open(os.path.join(HERE, fn), "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["순번", "전략", "n1", "n2", "n3", "n4", "n5", "n6"])
+            for i, t in enumerate(tickets, 1):
+                w.writerow([i, name, *t])
+    total = sum(1 for r in rows if int(r["target_round"]) == target)
+    print(f"  저장 확인: {target}회용 {len(tickets)}장을 저장했습니다 (저장 {save_id}번째, 이 회차 누적 {total}장). 파일: {os.path.basename(game.picks)}")
+    if save_id > 1:
+        print(f"  ※ 이 회차에 이미 저장한 번호가 있어 저장 {save_id}번째로 따로 기록했습니다. 결과 확인에서는 저장 묶음별로 나눠 채점합니다.")
+    return save_id
+
+
+def postmortem(game, res, verbose=True):
+    """저장 번호를 회차별로 복기한다: 당첨번호를 몇 개나 한 번이라도 담았는지, 한 번도 안 고른 당첨번호, 번호 쏠림, 당첨번호가 각 필터를 통과했는지."""
+    by = {}
+    for r in read_picks(game):
+        rd = int(r["target_round"])
+        if rd in res:
+            by.setdefault((rd, r["save_id"]), []).append(tuple(int(x) for x in r["ticket"].split("-")))
+    idx = {d[0]: j for j, d in enumerate(game.draws)}
+    out = []
+    for (rd, sv), tk in sorted(by.items()):
+        win, bonus, amt = res[rd]
+        used = Counter(x for t in tk for x in t)
+        got = sorted(set(win) & set(used))
+        miss = sorted(set(win) - set(used))
+        top = used.most_common(1)[0]
+        f = feat(win, context(game.draws, idx[rd])) if idx[rd] >= W else None
+        out.append((rd, sv, win, len(tk), len(used), got, miss, top, f))
+    if verbose:
+        print("\n  ===== 복기 (당첨번호가 우리 번호 묶음에 들어 있었나) =====")
+        for rd, sv, win, n, nu, got, miss, top, f in out:
+            print(f"  {rd}회(저장 {sv}) 당첨 {'-'.join(map(str, win))} / 뽑은 {n}장에 쓰인 서로 다른 번호 {nu}개 (한 번호 최다 {top[0]}번 {top[1]}장)")
+            print(f"     한 번이라도 담긴 당첨번호 {len(got)}개 {got}, 한 번도 안 담긴 당첨번호 {len(miss)}개 {miss}")
+            if f:
+                print(f"     그 회차 당첨번호의 특징: 쌍 {f[0]} 삼중 {f[1]} 핫 {f[2]} 콜드 {f[3]} 분산 {f[4]} 겹침 {f[5]}  (핫 3~5 구간 밖이면 핫 필터 전략은 이 번호를 만들 수 없었음)")
+    return out
 
 
 def check_picks(game):
@@ -745,8 +802,10 @@ def check_picks(game):
     res = {r: (c, b, a) for r, c, b, a in game.draws}
     p5 = p5_of(game.N)
     by, detail = {}, {}
-    with open(game.picks, encoding="utf-8") as f:
-        for r in csv.DictReader(f):
+    all_rows = read_picks(game)
+    multi = {rd for rd in {int(r["target_round"]) for r in all_rows} if len({r["save_id"] for r in all_rows if int(r["target_round"]) == rd}) > 1}
+    if True:
+        for r in all_rows:
             rd = int(r["target_round"])
             if rd not in res:
                 continue
@@ -754,7 +813,8 @@ def check_picks(game):
             win, bonus, amt = res[rd]
             rk = rank_of(t, win, bonus)
             hit = len(set(t) & set(win))
-            e = by.setdefault(r["strategy_name"], {"n": 0, "hits": 0, "p5": 0, "best": 0, "money": 0})
+            nm = r["strategy_name"] + (f" [{rd}회 저장{r['save_id']}]" if rd in multi else "")
+            e = by.setdefault(nm, {"n": 0, "hits": 0, "p5": 0, "best": 0, "money": 0})
             e["n"] += 1
             e["hits"] += hit
             e["p5"] += rk > 0
@@ -781,6 +841,7 @@ def check_picks(game):
     lines += ["", f"무작위로 찍어도 평균 맞힌 개수는 {base:.2f}개, 5등 이상 비율은 약 {p5:.1%} 입니다. 표본이 적으면 우연으로 설명됩니다."]
     with open(os.path.join(HERE, f"weekly_report_{game.key}.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+    postmortem(game, res)
     print(f"\n  → weekly_report_{game.key}.md 저장")
 
 
@@ -1035,7 +1096,7 @@ def run_max(c):
     return best
 
 
-def smart_rules(draws, N):
+def smart_rules(draws, N, payout=False):
     """과거 당첨번호에서 흔한 모양만 남기는 규칙. 합 구간은 최근 300회의 5~95% 구간."""
     s_ = sorted(sum(x[1]) for x in draws[-300:])
     band = (s_[int(len(s_) * 0.05)], s_[int(len(s_) * 0.95)])
@@ -1044,11 +1105,32 @@ def smart_rules(draws, N):
             ("홀수 1~5개 (전부 홀수/짝수 제외)", lambda c: 1 <= sum(x % 2 for x in c) <= 5),
             (f"낮은 번호(1~{N // 2}) 1~5개 (한쪽 쏠림 제외)", lambda c: 1 <= sum(x <= N // 2 for x in c) <= 5),
             ("같은 끝자리 3개까지", lambda c: max(Counter(x % 10 for x in c).values()) <= 3),
-            ("같은 10단위 구간 3개까지", lambda c: max(Counter(x // 10 for x in c).values()) <= 3)]
+            ("같은 10단위 구간 3개까지", lambda c: max(Counter(x // 10 for x in c).values()) <= 3)] + (
+        [("[당첨금] 1~12번은 1개까지 (생일·달 번호 몰림 피하기)", lambda c: sum(x <= 12 for x in c) <= 1),
+         ("[당첨금] 합계 135 이상 (사람들이 덜 고르는 큰 번호 쪽)", lambda c: sum(c) >= 135)] if payout and N == 45 else [])
 
 
 def smart_ok(c, rules):
     return all(f(c) for _, f in rules)
+
+
+def show_payout_study(game):
+    """과거 당첨번호의 모양별 1등 당첨금을 보여 준다(당첨 확률이 아니라 '당첨됐을 때 받는 금액'에 관한 자료)."""
+    rows = [(x[0], x[1], x[3][0]) for x in game.draws if x[0] >= 600 and len(x) > 3 and x[3] and x[3][0]]
+    if len(rows) < 100:
+        return
+    def med(v):
+        v = sorted(v)
+        return v[len(v) // 2]
+    print("\n  ------ 당첨금 연구: 어떤 모양의 당첨번호가 1등 당첨금을 더 많이 나눴나 (600회 이후 %d회차) ------" % len(rows))
+    print("  " + padr("당첨번호의 모양", 34) + padl("회차", 6) + padl("1등 당첨금 중앙값", 20))
+    groups = (("1~12번이 0~1개", lambda c: sum(x <= 12 for x in c) <= 1), ("1~12번이 2개", lambda c: sum(x <= 12 for x in c) == 2), ("1~12번이 3개 이상", lambda c: sum(x <= 12 for x in c) >= 3),
+              ("합계 150 이하", lambda c: sum(c) <= 150), ("합계 151 이상", lambda c: sum(c) >= 151))
+    for nm, f in groups:
+        v = [a for _, c, a in rows if f(c)]
+        if v:
+            print("  " + padr(nm, 34) + padl(str(len(v)), 6) + padl(f"{med(v) / 1e8:.1f}억 원", 20))
+    print("  * 작은 번호(생일·달)가 많이 나온 회차는 1등이 여러 명이 되어 당첨금이 줄었습니다. 당첨 확률은 그대로이고, 1~3등에 당첨됐을 때 받는 금액만 달라집니다(4·5등은 고정 금액).")
 
 
 def show_smart_rules(game):
@@ -1085,7 +1167,7 @@ def candidate_pool(game, row, n, rng, i=None, fixed=(), banned=(), smart=False):
     i = len(d) if i is None else i
     ctx = context(d, i)
     past = {c for _, c, _, _ in d[:i]}
-    rules = smart_rules(d[:i], N) if smart else None
+    rules = smart_rules(d[:i], N, payout=(smart == 2)) if smart else None
     if row["kind"] == "F":
         opts = [tuple(o) if o else None for o in row["opts"]]
         pool_nums = [x for x in range(1, N + 1) if x not in banned and x not in fixed]
@@ -1154,6 +1236,26 @@ def diverse_pick(pool, k):
     return chosen
 
 
+def cap_use(ordered, n, cap=None):
+    """순서대로 장을 고르되 한 번호가 cap 장을 넘게 쓰이지 않게 한다(기본: 평균 사용 횟수의 2배, 10장 미만이면 제한 없음).
+    조건에 맞는 장이 모자라면 남은 칸은 순서대로 채운다. 확률을 높이는 것이 아니라 번호가 한쪽에 몰리는 것을 막는다."""
+    if cap is None:
+        cap = max(3, -(-n * 6 * 2 // 45)) if n >= 10 else 99
+    use, out = Counter(), []
+    for c in ordered:
+        if len(out) >= n:
+            break
+        if all(use[x] < cap for x in c):
+            out.append(c)
+            use.update(c)
+    for c in ordered:
+        if len(out) >= n:
+            break
+        if c not in out:
+            out.append(c)
+    return out
+
+
 def ss_select(pool, method, n, rng, st, limits=(None, None, None)):
     """후보 pool 에서 method 번 방법으로 n장을 고른다. limits=(금지삼중 최대, 금지사중 최대, 금지오중 최대), None 이면 제한 없음."""
     if not pool:
@@ -1170,7 +1272,7 @@ def ss_select(pool, method, n, rng, st, limits=(None, None, None)):
             ft, fq, ff = forbidden_counts(c, st["T"], st["Q"], st["F"])
             if all(lim is None or v <= lim for v, lim in zip((ft, fq, ff), limits)):
                 keep.append(c)
-        return keep[:n]
+        return cap_use(keep, n)
     if method == 2:
         key = lambda c: -sum(st["rec"][x] for x in c)
     elif method == 3:
@@ -1181,7 +1283,7 @@ def ss_select(pool, method, n, rng, st, limits=(None, None, None)):
         key = lambda c: sum(t not in st["T"] for t in combinations(c, 3))
     else:
         key = lambda c: sum(q not in st["Q"] for q in combinations(c, 4))
-    return sorted(pool, key=key)[:n]
+    return cap_use(sorted(pool, key=key), n)
 
 
 SS_PRESETS = {"7a": ("금지삼중 2개 이하", (2, None, None)), "7b": ("금지삼중 2개 이하 + 금지사중 14개 이하", (2, 14, None)), "7c": ("금지오중 5개 이하 (나온 오중이 1개 이상)", (None, None, 5))}
@@ -1531,9 +1633,12 @@ def pick_numbers(game, rows, shown):
     rng = random.Random()
     method, limits, tag2 = 0, (None, None, None), ""
     show_smart_rules(game)
+    if game.key == "kr":
+        show_payout_study(game)
     print(f"\n   1  이상한 조합 거르기 (스마트 정리, 기본)")
-    print("   2  거르지 않기")
-    smart = ask_int("선택", 1, 1, 2) == 1
+    print("   2  스마트 정리 + 당첨금 키우기 (사람들이 많이 고르는 번호를 피해 1~3등 당첨금을 나눠 갖는 사람을 줄입니다)")
+    print("   3  거르지 않기")
+    smart = {1: 1, 2: 2, 3: 0}[ask_int("선택", 1, 1, 3)]
     if way == 2:
         try:
             sz = json.load(open(size_cache_path(game), encoding="utf-8"))
@@ -1582,10 +1687,10 @@ def pick_numbers(game, rows, shown):
         ctx, core = context(game.draws, len(game.draws)), None
         if len(tickets) < n:
             print(f"  기준에 맞는 후보가 {len(tickets)}개뿐이라 그만큼만 보여 드립니다. 기준을 느슨하게 해 보세요.")
-        tag2 = (f" -> 후보{pool_n:,}개에서 '{SS_METHODS[method].split(' (')[0]}'" if method != 7 else f" -> 후보{pool_n:,}개에서 {tag_lim}") + (" + 스마트 정리" if smart else "")
+        tag2 = (f" -> 후보{pool_n:,}개에서 '{SS_METHODS[method].split(' (')[0]}'" if method != 7 else f" -> 후보{pool_n:,}개에서 {tag_lim}") + ((" + 스마트 정리 + 당첨금 키우기" if smart == 2 else " + 스마트 정리") if smart else "")
         print(f"\n  후보 {len(pool):,}개 중에서 고른 결과입니다.")
     elif smart:
-        pool = candidate_pool(game, row, max(400, n * 20), rng, fixed=tuple(fixed), banned=tuple(banned), smart=True)
+        pool = candidate_pool(game, row, max(400, n * 20), rng, fixed=tuple(fixed), banned=tuple(banned), smart=smart)
         tickets = []
         for c in pool:   # 서로 4개 넘게 겹치지 않는 조합만 차례로
             if all(len(set(c) & set(o)) <= 3 for o in tickets):
@@ -1599,7 +1704,7 @@ def pick_numbers(game, rows, shown):
                 if len(tickets) == n:
                     break
         ctx, core = context(game.draws, len(game.draws)), None
-        tag2 = " + 스마트 정리"
+        tag2 = " + 스마트 정리 + 당첨금 키우기" if smart == 2 else " + 스마트 정리"
     else:
         tickets, ctx, core = make_tickets(game, row, n, rng, tuple(fixed), tuple(banned))
     row = dict(row, name=row["name"] + tag2) if tag2 else row
