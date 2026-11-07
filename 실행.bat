@@ -1,8 +1,29 @@
 @echo off
-chcp 65001 > nul
-mode con: cols=130 lines=60
+setlocal
+title ·Î¶Ç Á¶ÇÕ ¸ÞÀÌÄ¿
 cd /d "%~dp0"
-where python > nul 2>&1 && (python lotto_maker.py) || (py lotto_maker.py)
+if not exist lotto_maker.py (
+  echo.
+  echo [¾È³»] ÀÌ ÆÄÀÏÀº ¾ÐÃàÀ» Ç¬ Æú´õ ¾È¿¡¼­ ½ÇÇàÇØ¾ß ÇÕ´Ï´Ù.
+  echo        ZIP ÆÄÀÏ ¾È¿¡¼­ ¹Ù·Î ¿­Áö ¸»°í, ¸ÕÀú ¾ÐÃàÀ» Ç¬ ´ÙÀ½ ´Ù½Ã ½ÇÇàÇØ ÁÖ¼¼¿ä.
+  echo        ^(ZIP ÆÄÀÏÀ» ¿À¸¥ÂÊ ¸¶¿ì½º·Î ´©¸£°í "¸ðµÎ ¾ÐÃà Ç®±â"^)
+  echo.
+  pause
+  exit /b 1
+)
+set "PYCMD="
+py -3 --version >nul 2>&1 && set "PYCMD=py -3"
+if not defined PYCMD python --version >nul 2>&1 && set "PYCMD=python"
+if not defined PYCMD (
+  echo.
+  echo [¾È³»] ÆÄÀÌ½ãÀÌ ¼³Ä¡µÇ¾î ÀÖÁö ¾Ê°Å³ª, ¼³Ä¡ÇÒ ¶§ 'Add python.exe to PATH' Ä­À» Ã¼Å©ÇÏÁö ¾Ê¾Ò½À´Ï´Ù.
+  echo        ¼³¸í¼­ÀÇ 1´Ü°è¸¦ º¸°í ÆÄÀÌ½ãÀ» ¼³Ä¡ÇØ ÁÖ¼¼¿ä. ^(python.org/downloads/windows^)
+  echo.
+  pause
+  exit /b 1
+)
+mode con: cols=130 lines=60 >nul 2>&1
+%PYCMD% lotto_maker.py
 echo.
-echo í”„ë¡œê·¸ëž¨ì´ ëë‚¬ìŠµë‹ˆë‹¤. ì´ ì°½ì„ ë‹«ìœ¼ë ¤ë©´ ì•„ë¬´ í‚¤ë‚˜ ëˆ„ë¥´ì„¸ìš”.
-pause > nul
+echo ÇÁ·Î±×·¥ÀÌ ³¡³µ½À´Ï´Ù. ÀÌ Ã¢À» ´ÝÀ¸·Á¸é ¾Æ¹« Å°³ª ´©¸£¼¼¿ä.
+pause >nul
