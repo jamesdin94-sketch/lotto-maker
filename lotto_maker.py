@@ -24,7 +24,7 @@ from collections import Counter
 from itertools import combinations
 from math import comb
 
-VERSION = "1.0"   # 구조가 바뀌면 앞자리(2.0), 전략·수치만 바뀌면 소수점(1.1). CHANGELOG.md 참고
+VERSION = "1.1"   # 구조가 바뀌면 앞자리(2.0), 전략·수치만 바뀌면 소수점(1.1). CHANGELOG.md 참고
 HERE = os.path.dirname(os.path.abspath(__file__))
 W = 10            # '최근' = 직전 10회
 SAMPLE = 2000     # 필터 격자 시뮬레이션: 회차마다 무작위 후보 수
@@ -1011,6 +1011,219 @@ def weekly(game, rows, picks_per=5):
     return summary
 
 
+# ---------------------------------------------------------------- 후보 1,000개 → 2차 선별 (옵션)
+POOL_N = 1000
+SS_METHODS = {
+    1: "서로 덜 겹치게 (번호를 넓게 흩어서)",
+    2: "최근 100회에 많이 나온 번호 점수가 높은 순",
+    3: "함께 나온 쌍 점수가 높은 순",
+    4: "과거 당첨번호의 모양(합·홀짝·높낮이)과 비슷한 순",
+    5: "금지삼중이 적은 순 (한 번도 같이 안 나온 세 번호 묶음이 적은 순)",
+    6: "이미 나온 사중이 많은 순 (금지사중이 적은 순)",
+    7: "금지삼중·금지사중·금지오중 기준을 내가 정해서 거르기",
+    8: "후보에서 그냥 무작위로",
+}
+
+
+def candidate_pool(game, row, n, rng, i=None, fixed=(), banned=()):
+    """전략 조건을 만족하는 후보 n개(서로 겹침 제한 없음). i = 몇 번째 회차를 앞두고 뽑는가(기본: 다음 회차)."""
+    d, N = game.draws, game.N
+    i = len(d) if i is None else i
+    ctx = context(d, i)
+    past = {c for _, c, _, _ in d[:i]}
+    if row["kind"] == "F":
+        opts = [tuple(o) if o else None for o in row["opts"]]
+        pool_nums = [x for x in range(1, N + 1) if x not in banned and x not in fixed]
+        out, tries = [], 0
+        while len(out) < n and tries < 600000:
+            tries += 1
+            c = tuple(sorted(list(fixed) + rng.sample(pool_nums, 6 - len(fixed))))
+            if c not in past and passes(feat(c, ctx), opts):
+                out.append(c)
+        return out
+    mode = next(x[2] for x in CORE_STRATEGIES if x[0] == row["id"])
+    return core_tickets(game, core_of(game, row["id"], i), ctx, sum_band(game, i), n, rng, mode, picks=picks_of(row["id"]), fixed=fixed, banned=banned, past=past, max_overlap=6)
+
+
+def seen_sets(draws):
+    """지금까지의 당첨 이력에서 한 번이라도 같이 나온 세·네·다섯 번호 묶음."""
+    T, Q, F = set(), set(), set()
+    for _, nums, _, _ in draws:
+        T.update(combinations(nums, 3))
+        Q.update(combinations(nums, 4))
+        F.update(combinations(nums, 5))
+    return T, Q, F
+
+
+def forbidden_counts(c, T, Q, F):
+    """(금지삼중 수 0~20, 금지사중 수 0~15, 금지오중 수 0~6): 조합 안의 묶음 중 과거에 한 번도 같이 나온 적 없는 것의 수"""
+    return (sum(t not in T for t in combinations(c, 3)), sum(q not in Q for q in combinations(c, 4)), sum(f not in F for f in combinations(c, 5)))
+
+
+def shape_of(c):
+    g_ = [c[k + 1] - c[k] for k in range(5)]
+    return (sum(c), sum(x % 2 for x in c), sum(x <= 22 for x in c), ac_of(c), max(g_))
+
+
+def ss_context(draws):
+    """2차 선별에 쓰는 통계(그 시점까지의 이력만): 최근 100회 번호 빈도, 쌍 빈도, 모양 평균·표준편차, 금지 조합 집합"""
+    rec, pairs = Counter(), Counter()
+    for k, (_, nums, _, _) in enumerate(draws):
+        pairs.update(combinations(nums, 2))
+        if k >= len(draws) - 100:
+            rec.update(nums)
+    shp = [shape_of(x[1]) for x in draws]
+    mu = [sum(v[j] for v in shp) / len(shp) for j in range(5)]
+    sd = [(sum((v[j] - mu[j]) ** 2 for v in shp) / len(shp)) ** 0.5 or 1 for j in range(5)]
+    T, Q, F = seen_sets(draws)
+    return {"rec": rec, "pairs": pairs, "mu": mu, "sd": sd, "T": T, "Q": Q, "F": F}
+
+
+def diverse_pick(pool, k):
+    """서로 덜 겹치게: 이미 고른 장과의 최대 겹침이 가장 작은 후보를 차례로 고른다(앞쪽 400개 후보에서)."""
+    chosen = [pool[0]]
+    cand = pool[1:400]
+    ov = [len(set(c) & set(pool[0])) for c in cand]
+    while len(chosen) < k and cand:
+        j = min(range(len(cand)), key=lambda x: ov[x])
+        chosen.append(cand[j])
+        sset = set(cand[j])
+        cand.pop(j)
+        ov.pop(j)
+        ov = [max(o, len(set(c) & sset)) for o, c in zip(ov, cand)]
+    return chosen
+
+
+def ss_select(pool, method, n, rng, st, limits=(None, None, None)):
+    """후보 pool 에서 method 번 방법으로 n장을 고른다. limits=(금지삼중 최대, 금지사중 최대, 금지오중 최대), None 이면 제한 없음."""
+    if not pool:
+        return []
+    pool = list(pool)
+    rng.shuffle(pool)   # 점수가 같을 때 앞쪽이 유리해지지 않게
+    if method == 1:
+        return diverse_pick(pool, n)
+    if method == 8:
+        return pool[:n]
+    if method == 7:
+        keep = []
+        for c in pool:
+            ft, fq, ff = forbidden_counts(c, st["T"], st["Q"], st["F"])
+            if all(lim is None or v <= lim for v, lim in zip((ft, fq, ff), limits)):
+                keep.append(c)
+        return keep[:n]
+    if method == 2:
+        key = lambda c: -sum(st["rec"][x] for x in c)
+    elif method == 3:
+        key = lambda c: -sum(st["pairs"][p_] for p_ in combinations(c, 2))
+    elif method == 4:
+        key = lambda c: sum(((a - m_) / s_) ** 2 for a, m_, s_ in zip(shape_of(c), st["mu"], st["sd"]))
+    elif method == 5:
+        key = lambda c: sum(t not in st["T"] for t in combinations(c, 3))
+    else:
+        key = lambda c: sum(q not in st["Q"] for q in combinations(c, 4))
+    return sorted(pool, key=key)[:n]
+
+
+SS_PRESETS = {"7a": ("금지삼중 2개 이하", (2, None, None)), "7b": ("금지삼중 2개 이하 + 금지사중 14개 이하", (2, 14, None)), "7c": ("금지오중 5개 이하 (나온 오중이 1개 이상)", (None, None, 5))}
+
+
+SS_ORDER = ["1", "2", "3", "4", "5", "6", "7a", "7b", "7c", "8"]
+
+
+def ss_recent(game, row, n, rounds=20, seed=4242):
+    """최근 rounds 회 각각에서 '그 회차 이전 자료만으로' 후보 1,000개를 뽑고 방법별로 n장을 골랐을 때의 5등 이상 횟수.
+    돌려주는 값: {방법: 5등 이상 횟수}, 후보 평균 기대 횟수(n장 기준), 회차 수"""
+    d = game.draws
+    rng = random.Random(seed)
+    got, exp, cnt = {k: 0 for k in SS_ORDER}, 0.0, 0
+    for i in range(len(d) - rounds, len(d)):
+        pool = candidate_pool(game, row, POOL_N, rng, i=i)
+        if len(pool) < n:
+            continue
+        win, bonus = d[i][1], d[i][2]
+        exp += n * sum(1 for c in pool if rank_of(c, win, bonus)) / len(pool)
+        st = ss_context(d[:i])
+        for k in SS_ORDER:
+            m, lim = (7, SS_PRESETS[k][1]) if k in SS_PRESETS else (int(k), (None, None, None))
+            got[k] += sum(1 for c in ss_select(pool, m, n, rng, st, lim) if rank_of(c, win, bonus))
+        cnt += 1
+    return got, exp, cnt
+
+
+def ss_cache_path(game):
+    return os.path.join(HERE, f"second_stage_{game.key}.json")
+
+
+def ss_experiment(game, rows, rounds=300, tickets=50, seed=777):
+    """시험: 전략으로 후보 1,000개를 뽑고 2차 선별로 tickets 장을 골랐을 때의 5등 이상 적중률이 '같은 후보 풀의 평균'보다 높은가.
+    회차마다 그 회차 이전 자료만 쓰고, 회차 단위로 z 를 낸다. 대상 전략: 조건 없음, ◆ 안정 추천, ★ 최근 20회 1위."""
+    d = game.draws
+    p5 = p5_of(game.N)
+    base = base_row(rows)
+    strategies = [("조건 없음(무작위)", base), ("◆ 안정 추천", recommended(rows, p5)), ("★ 최근 20회 1위", recent_best(rows))]
+    out = {}
+    for si, (sname, row) in enumerate(strategies):
+        rng = random.Random(seed + si)
+        res = {}
+        print(f"  [{sname}] {row['name']}")
+        start = len(d) - rounds
+        for i in range(start, len(d)):
+            pool = candidate_pool(game, row, POOL_N, rng, i=i)
+            if len(pool) < POOL_N // 2:
+                continue
+            win, bonus = d[i][1], d[i][2]
+            hit = {c: 1 if rank_of(c, win, bonus) else 0 for c in pool}
+            prate = sum(hit.values()) / len(pool)
+            st = ss_context(d[:i])
+            todo = [(str(m), m, (None, None, None)) for m in (1, 2, 3, 4, 5, 6, 8)] + [(k_, 7, v[1]) for k_, v in SS_PRESETS.items()]
+            for key, m, lim in todo:
+                pick = ss_select(pool, m, tickets, rng, st, lim)
+                if len(pick) >= 5:
+                    res.setdefault(key, []).append(sum(hit[c] for c in pick) / len(pick) - prate)
+            if (i - start + 1) % 50 == 0:
+                print(f"     {i - start + 1}/{rounds} 회차 …")
+        tab = {}
+        for key, diffs in res.items():
+            m_ = sum(diffs) / len(diffs)
+            sdv = (sum((x - m_) ** 2 for x in diffs) / max(len(diffs) - 1, 1)) ** 0.5
+            tab[key] = [m_, m_ / (sdv / len(diffs) ** 0.5) if sdv else 0.0, len(diffs)]
+        out[sname] = {"strategy": row["name"], "rules": tab}
+    json.dump({"last": d[-1][0], "rounds": rounds, "tickets": tickets, "strategies": out}, open(ss_cache_path(game), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    return out
+
+
+def ss_summary(game):
+    """저장된 시험 결과에서 방법별 평균 차이(%p)와 평균 z. 결과가 없으면 None."""
+    try:
+        c = json.load(open(ss_cache_path(game), encoding="utf-8"))
+    except Exception:
+        return None
+    agg = {}
+    for v in c["strategies"].values():
+        for key, (m_, z, _n) in v["rules"].items():
+            agg.setdefault(key, []).append((m_, z))
+    return {k: (sum(a for a, _ in v) / len(v), sum(b for _, b in v) / len(v), max(abs(b) for _, b in v)) for k, v in agg.items()}, c["rounds"]
+
+
+def show_ss_experiment(game, rows, rounds=150):
+    print(f"\n  후보 {POOL_N:,}개를 뽑은 뒤 2차로 고르면 후보 평균보다 5등 이상이 더 자주 나오는지 과거 {rounds}회로 시험합니다. (몇 분 걸립니다)")
+    res = ss_experiment(game, rows, rounds=rounds)
+    show_ss_table(res, rounds)
+
+
+def show_ss_table(res, rounds):
+    names = {**{str(k): v for k, v in SS_METHODS.items()}, **{k: "   " + v[0] for k, v in SS_PRESETS.items()}}
+    print(f"\n  ===== 후보 1,000개 → 2차 선별 시험 (과거 {rounds}회, 같은 후보 풀의 평균과 비교) =====")
+    print("  " + padr("선별 방법", 66) + "".join(padl(n_, 18) for n_ in res))
+    for key in ["1", "2", "3", "4", "5", "6", "7a", "7b", "7c", "8"]:
+        line = "  " + padr(cut(names[key], 64), 66)
+        for v in res.values():
+            m_, z, _ = v["rules"].get(key, [0, 0, 0])
+            line += padl(f"{m_ * 100:+.2f}%p (z{z:+.1f})", 18)
+        print(line)
+    print("  (+ 이면 후보 평균보다 5등 이상이 더 자주 나왔다는 뜻. z 의 절댓값이 2 보다 작으면 우연의 범위입니다. 후보에서 그냥 무작위로 고른 8번 줄도 우연으로 이만큼 흔들립니다)")
+
+
 # ---------------------------------------------------------------- 화면(CMD)
 def ask(msg, default):
     s = input(f"  {msg} [{default}]: ").strip()
@@ -1029,6 +1242,23 @@ def ask_int(msg, default, lo=None, hi=None):
             print("  숫자만 입력해 주세요. (예: 3)")
             continue
         if (lo is not None and v < lo) or (hi is not None and v > hi):
+            print(f"  {lo}부터 {hi}까지의 숫자를 입력해 주세요.")
+            continue
+        return v
+
+
+def ask_opt_int(msg, lo, hi):
+    """숫자 하나를 입력받되, 그냥 엔터면 None(제한 없음)."""
+    while True:
+        t = input(f"  {msg} [제한 없음]: ").strip()
+        if not t:
+            return None
+        try:
+            v = int(t)
+        except ValueError:
+            print("  숫자만 입력해 주세요.")
+            continue
+        if v < lo or v > hi:
             print(f"  {lo}부터 {hi}까지의 숫자를 입력해 주세요.")
             continue
         return v
@@ -1122,7 +1352,43 @@ def pick_numbers(game, rows, shown):
         print("  꼭 넣을 번호는 5개까지만 가능합니다. 앞의 5개만 사용합니다.")
         fixed = fixed[:5]
     fixed = tuple(x for x in fixed if x not in banned)
-    tickets, ctx, core = make_tickets(game, row, n, random.Random(), tuple(fixed), tuple(banned))
+    print("\n  ------ 어떻게 뽑을까요? ------")
+    print("   1  바로 뽑기 (기본)")
+    print(f"   2  이 전략으로 후보 {POOL_N:,}개를 먼저 뽑은 뒤, 그 안에서 다시 골라서")
+    way = ask_int("선택", 1, 1, 2)
+    rng = random.Random()
+    method, limits, tag2 = 0, (None, None, None), ""
+    if way == 2:
+        print(f"\n  최근 20회를 되돌려서 이 전략 + 각 선별 방법을 써 봤습니다. (회차마다 그때까지의 자료만 사용, 잠시 걸립니다)")
+        got, exp, cnt = ss_recent(game, row, n)
+        print(f"  ------ 후보에서 어떤 기준으로 고를까요?  (최근 {cnt}회, 회차마다 {n}장씩 골랐을 때 5등 이상 횟수) ------")
+        names = {**{str(k_): v for k_, v in SS_METHODS.items()}, **{k_: "   (예) " + v[0] for k_, v in SS_PRESETS.items()}}
+        for k_ in ["1", "2", "3", "4", "5", "6"]:
+            print(f"   {k_}  " + padr(cut(names[k_], 62), 64) + f" {got[k_]:>3}회")
+        print("   7  " + padr("금지삼중·금지사중·금지오중 기준을 내가 정해서 거르기", 64))
+        for k_ in ["7a", "7b", "7c"]:
+            print("      " + padr(cut(names[k_], 62), 64) + f" {got[k_]:>3}회")
+        print("   8  " + padr(cut(names["8"], 62), 64) + f" {got['8']:>3}회")
+        print(f"      (참고: 후보 {POOL_N:,}개를 아무렇게나 {n}장 골랐을 때의 기대 횟수 약 {exp:.1f}회 / 20회는 적어서 +-2회 차이는 우연입니다)")
+        print("  ※ 더 긴 과거(300회) 시험에서는 어느 방법도 후보 평균보다 뚜렷하게 좋지 않았습니다. 메뉴 5 -> 5 에서 볼 수 있습니다.")
+        print("  최근 성적과 위 설명을 보고 마지막으로 직접 고르세요.")
+        method = ask_int("선택", 1, 1, 8)
+        if method == 7:
+            print("  기준을 숫자로 입력합니다. 상관없으면 그냥 엔터. (금지삼중 0~20, 금지사중 0~15, 금지오중 0~6)")
+            limits = (ask_opt_int("금지삼중이 최대 몇 개까지? (예: 2)", 0, 20), ask_opt_int("금지사중이 최대 몇 개까지? (예: 14)", 0, 15), ask_opt_int("금지오중이 최대 몇 개까지? (예: 5)", 0, 6))
+        pool = candidate_pool(game, row, POOL_N, rng, fixed=tuple(fixed), banned=tuple(banned))
+        if len(pool) < n:
+            print(f"  조건에 맞는 후보를 {len(pool)}개밖에 만들지 못했습니다. 조건을 줄이거나 바로 뽑기를 써 보세요.")
+            return
+        tickets = ss_select(pool, method, n, rng, ss_context(game.draws), limits)
+        ctx, core = context(game.draws, len(game.draws)), None
+        if len(tickets) < n:
+            print(f"  기준에 맞는 후보가 {len(tickets)}개뿐이라 그만큼만 보여 드립니다. 기준을 느슨하게 해 보세요.")
+        tag2 = f" -> 후보{POOL_N:,}개에서 '{SS_METHODS[method].split(' (')[0]}'"
+        print(f"\n  후보 {len(pool):,}개 중에서 고른 결과입니다.")
+    else:
+        tickets, ctx, core = make_tickets(game, row, n, rng, tuple(fixed), tuple(banned))
+    row = dict(row, name=row["name"] + tag2) if tag2 else row
     print(f"\n  선택한 전략: {row['name']}  ({nxt}회용)")
     show_tickets(tickets, ctx, core)
     if tickets:
@@ -1200,8 +1466,8 @@ def main():
         elif m == 4:
             check_picks(game)
         elif m == 5:
-            print("\n  1  암호키 신뢰도    2  신호 분석    3  주간 분석 (금요일에 한 번)    4  25수 풀 분석    0  돌아가기")
-            k = ask_int("선택", 0, 0, 4)
+            print("\n  1  암호키 신뢰도    2  신호 분석    3  주간 분석 (금요일에 한 번)    4  25수 풀 분석    5  후보 1,000개 -> 2차 선별 시험    0  돌아가기")
+            k = ask_int("선택", 0, 0, 5)
             if k == 1:
                 show_ciphers(game)
             elif k == 2:
@@ -1210,6 +1476,19 @@ def main():
                 weekly(game, all_rows)
             elif k == 4:
                 pool_report(game)
+            elif k == 5:
+                saved = None
+                try:
+                    saved = json.load(open(ss_cache_path(game), encoding="utf-8"))
+                except Exception:
+                    pass
+                if saved:
+                    show_ss_table(saved["strategies"], saved["rounds"])
+                    print("\n  1  이 결과를 다시 계산하기 (몇 분 걸립니다)    0  돌아가기")
+                    if ask_int("선택", 0, 0, 1) == 1:
+                        show_ss_experiment(game, all_rows)
+                else:
+                    show_ss_experiment(game, all_rows)
 
 if __name__ == "__main__":
     try:
