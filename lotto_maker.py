@@ -1133,75 +1133,78 @@ SS_PRESETS = {"7a": ("금지삼중 2개 이하", (2, None, None)), "7b": ("금�
 SS_ORDER = ["1", "2", "3", "4", "5", "6", "7a", "7b", "7c", "8"]
 
 
+def ss_tally(tk, win, bonus, amt, t):
+    """고른 장 tk 를 당첨번호와 맞춰 t = [장수, 5등, 4등 이상, 당첨금] 에 더한다."""
+    t[0] += len(tk)
+    for c in tk:
+        rk = rank_of(c, win, bonus)
+        if rk:
+            if rk <= 4:
+                t[2] += 1
+            else:
+                t[1] += 1
+            if amt:
+                t[3] += amt[rk - 1]
+
+
 def ss_recent(game, row, n, rounds=20, seed=4242):
-    """최근 rounds 회 각각에서 '그 회차 이전 자료만으로' 후보 1,000개를 뽑고 방법별로 n장을 골랐을 때의 5등 이상 횟수.
-    돌려주는 값: {방법: 5등 이상 횟수}, 후보 평균 기대 횟수(n장 기준), 회차 수"""
+    """최근 rounds 회 각각에서 '그 회차 이전 자료만으로' 후보 1,000개를 뽑고 방법별로 n장을 골랐을 때의 집계 {방법: [장수, 5등, 4등 이상, 당첨금]}"""
     d = game.draws
     rng = random.Random(seed)
-    got, exp, cnt = {k: 0 for k in SS_ORDER}, 0.0, 0
+    got = {k: [0, 0, 0, 0] for k in SS_ORDER}
     for i in range(len(d) - rounds, len(d)):
         pool = candidate_pool(game, row, POOL_N, rng, i=i)
         if len(pool) < n:
             continue
-        win, bonus = d[i][1], d[i][2]
-        exp += n * sum(1 for c in pool if rank_of(c, win, bonus)) / len(pool)
+        win, bonus, amt = d[i][1], d[i][2], d[i][3] if len(d[i]) > 3 else None
         st = ss_context(d[:i])
         for k in SS_ORDER:
             m, lim = (7, SS_PRESETS[k][1]) if k in SS_PRESETS else (int(k), (None, None, None))
-            got[k] += sum(1 for c in ss_select(pool, m, n, rng, st, lim) if rank_of(c, win, bonus))
-        cnt += 1
-    return got, exp, cnt
+            ss_tally(ss_select(pool, m, n, rng, st, lim), win, bonus, amt, got[k])
+    return got
 
 
 FB_GRID = [(a, b, c) for a in (None, 0, 1, 2, 3) for b in (None, 13, 14) for c in (None, 5)]
 
 
-def fb_label(v):
-    return "제한없음" if v is None else f"{v}개 이하"
+def fb_label(g):
+    """기준 한 줄 설명: 삼중 · 사중 · 오중 (숫자 이하, 없으면 -)"""
+    return "  ".join(f"{nm}{'-' if v is None else str(v) + '이하'}" for nm, v in zip(("삼중", "사중", "오중"), g))
 
 
 def ss_forbid_table(game, row, n, rounds=20, seed=5151):
-    """금지삼중·금지사중·금지오중 기준 조합표: 최근 rounds 회를 그 회차 이전 자료만으로 되돌려, 기준마다
-    (남는 후보 수 평균, 남은 후보의 5등 이상 적중률, 뽑은 n장의 5등 이상 횟수, 후보가 n장보다 적었던 회차 수)"""
+    """금지삼중·사중·오중 기준 30가지를 최근 rounds 회에 적용했을 때의 집계 {기준: [장수, 5등, 4등 이상, 당첨금]}"""
     d = game.draws
     rng = random.Random(seed)
-    acc = {g: [0.0, 0.0, 0, 0, 0] for g in FB_GRID}   # 남은 수 합, 적중률 합, 뽑은 장 적중, 후보 부족 회차, 적중률 계산 회차
-    base_rate, cnt = 0.0, 0
+    acc = {g: [0, 0, 0, 0] for g in FB_GRID}
     for i in range(len(d) - rounds, len(d)):
         pool = candidate_pool(game, row, POOL_N, rng, i=i)
         if len(pool) < n:
             continue
-        win, bonus = d[i][1], d[i][2]
+        win, bonus, amt = d[i][1], d[i][2], d[i][3] if len(d[i]) > 3 else None
         st = ss_context(d[:i])
-        info = [(c, forbidden_counts(c, st["T"], st["Q"], st["F"]), 1 if rank_of(c, win, bonus) else 0) for c in pool]
-        base_rate += sum(h for _, _, h in info) / len(info)
-        cnt += 1
+        info = [(c, forbidden_counts(c, st["T"], st["Q"], st["F"])) for c in pool]
         for g in FB_GRID:
-            keep = [(c, h) for c, f, h in info if all(lim is None or v <= lim for v, lim in zip(f, g))]
-            a = acc[g]
-            a[0] += len(keep)
-            if keep:
-                a[1] += sum(h for _, h in keep) / len(keep)
-                a[4] += 1
+            keep = [c for c, f in info if all(lim is None or v <= lim for v, lim in zip(f, g))]
             rng.shuffle(keep)
-            if len(keep) < n:
-                a[3] += 1
-            a[2] += sum(h for _, h in keep[:n])
-    return acc, base_rate / max(cnt, 1), cnt
+            ss_tally(keep[:n], win, bonus, amt, acc[g])
+    return acc
 
 
-def show_fb_table(acc, base_rate, cnt, n):
-    print(f"\n  ------ 금지삼중·금지사중·금지오중 기준 조합표 (최근 {cnt}회, 회차마다 {n}장) ------")
-    print("  (금지삼중 = 조합 속 세 번호 묶음 20개 중 과거에 한 번도 같이 안 나온 묶음의 수. 사중은 15개, 오중은 6개 중에서 셉니다. 숫자가 작을수록 '이미 나왔던 묶음'만 쓰는 엄격한 기준입니다)")
-    print("  " + padl("번호", 4) + "  " + padr("금지삼중", 10) + padr("금지사중", 10) + padr("금지오중", 10) + padl("남는 후보", 10) + padl("후보 적중률", 12) + padl(f"뽑은 {n}장 5등+", 14) + "  비고")
+def tally_cells(t, money=True):
+    return padl(str(t[0]), 6) + padl(str(t[1] + t[2]), 6) + padl(str(t[1]), 6) + padl(str(t[2]), 8) + (padl(f"{t[3]:,}", 13) if money else "")
+
+
+TALLY_HEAD = padl("뽑은장", 6) + padl("당첨", 6) + padl("5등", 6) + padl("4등이상", 8) + padl("당첨금(원)", 13)
+
+
+def show_fb_table(acc, n, rounds=20):
+    print(f"\n  ------ 금지삼중·사중·오중 기준 조합표 (최근 {rounds}회를 그 회차 이전 자료만으로 되돌린 결과, 회차마다 최대 {n}장) ------")
+    print("  삼중·사중·오중 = 조합 속 세·네·다섯 번호 묶음 중 과거에 한 번도 같이 안 나온 묶음의 수. 숫자가 작을수록 엄격한 기준입니다.")
+    print("  " + padl("번호", 4) + "  " + padr("금지삼중", 10) + padr("금지사중", 10) + padr("금지오중", 10) + TALLY_HEAD)
     for k, g in enumerate(FB_GRID, 1):
-        a = acc[g]
-        left = a[0] / max(cnt, 1)
-        rate_ = a[1] / a[4] * 100 if a[4] else 0.0
-        note = f"후보 부족 {a[3]}회" if a[3] else ""
-        print("  " + padl(str(k), 4) + "  " + padr(fb_label(g[0]), 10) + padr(fb_label(g[1]), 10) + padr(fb_label(g[2]), 10) + padl(f"{left:.0f}개", 10) + padl(f"{rate_:.2f}%", 12) + padl(f"{a[2]}회", 14) + "  " + note)
-    print(f"  (기준을 안 거는 후보 전체의 평균 5등 이상 적중률 = {base_rate * 100:.2f}%. 이보다 뚜렷하게 높은 줄이 없으면 그 기준은 우연과 구분되지 않습니다. 뽑은 장수가 적으면 '후보 적중률' 열이 더 믿을 만합니다)")
-    print("  (기준을 엄격하게 할수록 남는 후보가 급격히 줄어듭니다. '후보 부족'이 있으면 그 회차에는 원하는 장수를 못 뽑습니다)")
+        print("  " + padl(str(k), 4) + "  " + "".join(padr("제한 없음" if v is None else f"{v}개 이하", 10) for v in g) + tally_cells(acc[g]))
+    print("  * 뽑은장 = 기준을 통과한 후보가 모자라서 n장을 못 채운 회차가 있으면 그만큼 적게 뽑힌 것입니다. 당첨 = 5등 이상 장수.")
 
 
 def ss_cache_path(game):
@@ -1414,23 +1417,23 @@ def pick_numbers(game, rows, shown):
     method, limits, tag2 = 0, (None, None, None), ""
     if way == 2:
         print(f"\n  최근 20회를 되돌려서 이 전략 + 각 선별 방법을 써 봤습니다. (회차마다 그때까지의 자료만 사용, 잠시 걸립니다)")
-        got, exp, cnt = ss_recent(game, row, n)
-        print(f"  ------ 후보에서 어떤 기준으로 고를까요?  (최근 {cnt}회, 회차마다 {n}장씩 골랐을 때 5등 이상 횟수) ------")
-        names = {**{str(k_): v for k_, v in SS_METHODS.items()}, **{k_: "   (예) " + v[0] for k_, v in SS_PRESETS.items()}}
+        got = ss_recent(game, row, n)
+        print(f"  ------ 후보에서 어떤 기준으로 고를까요?  (최근 20회를 되돌려 회차마다 {n}장씩 골랐다면) ------")
+        names = {**{str(k_): v for k_, v in SS_METHODS.items()}, **{k_: "  예) " + v[0] for k_, v in SS_PRESETS.items()}}
+        print("       " + padr("방법", 52) + TALLY_HEAD)
         for k_ in ["1", "2", "3", "4", "5", "6"]:
-            print(f"   {k_}  " + padr(cut(names[k_], 62), 64) + f" {got[k_]:>3}회")
-        print("   7  " + padr("금지삼중·금지사중·금지오중 기준을 내가 정해서 거르기", 64))
+            print(f"   {k_}   " + padr(cut(names[k_].split(" (")[0], 50), 52) + tally_cells(got[k_]))
+        print("   7   " + padr("금지삼중·사중·오중 기준을 내가 정해서 (다음 화면에 표)", 52))
         for k_ in ["7a", "7b", "7c"]:
-            print("      " + padr(cut(names[k_], 62), 64) + f" {got[k_]:>3}회")
-        print("   8  " + padr(cut(names["8"], 62), 64) + f" {got['8']:>3}회")
-        print(f"      (참고: 후보 {POOL_N:,}개를 아무렇게나 {n}장 골랐을 때의 기대 횟수 약 {exp:.1f}회 / 20회는 적어서 +-2회 차이는 우연입니다)")
-        print("  ※ 더 긴 과거(300회) 시험에서는 어느 방법도 후보 평균보다 뚜렷하게 좋지 않았습니다. 메뉴 5 -> 5 에서 볼 수 있습니다.")
-        print("  최근 성적과 위 설명을 보고 마지막으로 직접 고르세요.")
+            print("       " + padr(cut(names[k_], 50), 52) + tally_cells(got[k_]))
+        print("   8   " + padr(cut(names["8"].split(" (")[0], 50), 52) + tally_cells(got["8"]))
+        print("  * 당첨 = 5등 이상 장수. 20회는 적어서 몇 장 차이는 우연입니다. 300회 시험에서는 어느 방법도 뚜렷하게 좋지 않았습니다(메뉴 5 -> 5).")
+        print("  최근 성적을 보고 마지막으로 직접 고르세요.")
         method = ask_int("선택", 1, 1, 8)
         if method == 7:
             print(f"\n  기준 조합표를 만드는 중입니다. (최근 20회, 잠시 걸립니다)")
-            acc, base_rate, cnt = ss_forbid_table(game, row, n)
-            show_fb_table(acc, base_rate, cnt, n)
+            acc = ss_forbid_table(game, row, n)
+            show_fb_table(acc, n)
             print(f"\n  위 표에서 쓸 줄의 번호를 입력하세요. 0 을 입력하면 세 가지 기준을 직접 숫자로 정합니다.")
             pickno = ask_int("조합표 번호", 0, 0, len(FB_GRID))
             if pickno:
@@ -1438,7 +1441,7 @@ def pick_numbers(game, rows, shown):
             else:
                 print("  기준을 숫자로 입력합니다. 상관없으면 그냥 엔터. (금지삼중 0~20, 금지사중 0~15, 금지오중 0~6)")
                 limits = (ask_opt_int("금지삼중이 최대 몇 개까지? (예: 2)", 0, 20), ask_opt_int("금지사중이 최대 몇 개까지? (예: 14)", 0, 15), ask_opt_int("금지오중이 최대 몇 개까지? (예: 5)", 0, 6))
-            tag_lim = f"금지삼중 {fb_label(limits[0])}, 사중 {fb_label(limits[1])}, 오중 {fb_label(limits[2])}"
+            tag_lim = "금지 " + fb_label(limits)
         pool = candidate_pool(game, row, POOL_N, rng, fixed=tuple(fixed), banned=tuple(banned))
         if len(pool) < n:
             print(f"  조건에 맞는 후보를 {len(pool)}개밖에 만들지 못했습니다. 조건을 줄이거나 바로 뽑기를 써 보세요.")
