@@ -1153,6 +1153,57 @@ def ss_recent(game, row, n, rounds=20, seed=4242):
     return got, exp, cnt
 
 
+FB_GRID = [(a, b, c) for a in (None, 0, 1, 2, 3) for b in (None, 13, 14) for c in (None, 5)]
+
+
+def fb_label(v):
+    return "제한없음" if v is None else f"{v}개 이하"
+
+
+def ss_forbid_table(game, row, n, rounds=20, seed=5151):
+    """금지삼중·금지사중·금지오중 기준 조합표: 최근 rounds 회를 그 회차 이전 자료만으로 되돌려, 기준마다
+    (남는 후보 수 평균, 남은 후보의 5등 이상 적중률, 뽑은 n장의 5등 이상 횟수, 후보가 n장보다 적었던 회차 수)"""
+    d = game.draws
+    rng = random.Random(seed)
+    acc = {g: [0.0, 0.0, 0, 0, 0] for g in FB_GRID}   # 남은 수 합, 적중률 합, 뽑은 장 적중, 후보 부족 회차, 적중률 계산 회차
+    base_rate, cnt = 0.0, 0
+    for i in range(len(d) - rounds, len(d)):
+        pool = candidate_pool(game, row, POOL_N, rng, i=i)
+        if len(pool) < n:
+            continue
+        win, bonus = d[i][1], d[i][2]
+        st = ss_context(d[:i])
+        info = [(c, forbidden_counts(c, st["T"], st["Q"], st["F"]), 1 if rank_of(c, win, bonus) else 0) for c in pool]
+        base_rate += sum(h for _, _, h in info) / len(info)
+        cnt += 1
+        for g in FB_GRID:
+            keep = [(c, h) for c, f, h in info if all(lim is None or v <= lim for v, lim in zip(f, g))]
+            a = acc[g]
+            a[0] += len(keep)
+            if keep:
+                a[1] += sum(h for _, h in keep) / len(keep)
+                a[4] += 1
+            rng.shuffle(keep)
+            if len(keep) < n:
+                a[3] += 1
+            a[2] += sum(h for _, h in keep[:n])
+    return acc, base_rate / max(cnt, 1), cnt
+
+
+def show_fb_table(acc, base_rate, cnt, n):
+    print(f"\n  ------ 금지삼중·금지사중·금지오중 기준 조합표 (최근 {cnt}회, 회차마다 {n}장) ------")
+    print("  (금지삼중 = 조합 속 세 번호 묶음 20개 중 과거에 한 번도 같이 안 나온 묶음의 수. 사중은 15개, 오중은 6개 중에서 셉니다. 숫자가 작을수록 '이미 나왔던 묶음'만 쓰는 엄격한 기준입니다)")
+    print("  " + padl("번호", 4) + "  " + padr("금지삼중", 10) + padr("금지사중", 10) + padr("금지오중", 10) + padl("남는 후보", 10) + padl("후보 적중률", 12) + padl(f"뽑은 {n}장 5등+", 14) + "  비고")
+    for k, g in enumerate(FB_GRID, 1):
+        a = acc[g]
+        left = a[0] / max(cnt, 1)
+        rate_ = a[1] / a[4] * 100 if a[4] else 0.0
+        note = f"후보 부족 {a[3]}회" if a[3] else ""
+        print("  " + padl(str(k), 4) + "  " + padr(fb_label(g[0]), 10) + padr(fb_label(g[1]), 10) + padr(fb_label(g[2]), 10) + padl(f"{left:.0f}개", 10) + padl(f"{rate_:.2f}%", 12) + padl(f"{a[2]}회", 14) + "  " + note)
+    print(f"  (기준을 안 거는 후보 전체의 평균 5등 이상 적중률 = {base_rate * 100:.2f}%. 이보다 뚜렷하게 높은 줄이 없으면 그 기준은 우연과 구분되지 않습니다. 뽑은 장수가 적으면 '후보 적중률' 열이 더 믿을 만합니다)")
+    print("  (기준을 엄격하게 할수록 남는 후보가 급격히 줄어듭니다. '후보 부족'이 있으면 그 회차에는 원하는 장수를 못 뽑습니다)")
+
+
 def ss_cache_path(game):
     return os.path.join(HERE, f"second_stage_{game.key}.json")
 
@@ -1377,8 +1428,17 @@ def pick_numbers(game, rows, shown):
         print("  최근 성적과 위 설명을 보고 마지막으로 직접 고르세요.")
         method = ask_int("선택", 1, 1, 8)
         if method == 7:
-            print("  기준을 숫자로 입력합니다. 상관없으면 그냥 엔터. (금지삼중 0~20, 금지사중 0~15, 금지오중 0~6)")
-            limits = (ask_opt_int("금지삼중이 최대 몇 개까지? (예: 2)", 0, 20), ask_opt_int("금지사중이 최대 몇 개까지? (예: 14)", 0, 15), ask_opt_int("금지오중이 최대 몇 개까지? (예: 5)", 0, 6))
+            print(f"\n  기준 조합표를 만드는 중입니다. (최근 20회, 잠시 걸립니다)")
+            acc, base_rate, cnt = ss_forbid_table(game, row, n)
+            show_fb_table(acc, base_rate, cnt, n)
+            print(f"\n  위 표에서 쓸 줄의 번호를 입력하세요. 0 을 입력하면 세 가지 기준을 직접 숫자로 정합니다.")
+            pickno = ask_int("조합표 번호", 0, 0, len(FB_GRID))
+            if pickno:
+                limits = FB_GRID[pickno - 1]
+            else:
+                print("  기준을 숫자로 입력합니다. 상관없으면 그냥 엔터. (금지삼중 0~20, 금지사중 0~15, 금지오중 0~6)")
+                limits = (ask_opt_int("금지삼중이 최대 몇 개까지? (예: 2)", 0, 20), ask_opt_int("금지사중이 최대 몇 개까지? (예: 14)", 0, 15), ask_opt_int("금지오중이 최대 몇 개까지? (예: 5)", 0, 6))
+            tag_lim = f"금지삼중 {fb_label(limits[0])}, 사중 {fb_label(limits[1])}, 오중 {fb_label(limits[2])}"
         pool = candidate_pool(game, row, POOL_N, rng, fixed=tuple(fixed), banned=tuple(banned))
         if len(pool) < n:
             print(f"  조건에 맞는 후보를 {len(pool)}개밖에 만들지 못했습니다. 조건을 줄이거나 바로 뽑기를 써 보세요.")
@@ -1387,7 +1447,7 @@ def pick_numbers(game, rows, shown):
         ctx, core = context(game.draws, len(game.draws)), None
         if len(tickets) < n:
             print(f"  기준에 맞는 후보가 {len(tickets)}개뿐이라 그만큼만 보여 드립니다. 기준을 느슨하게 해 보세요.")
-        tag2 = f" -> 후보{POOL_N:,}개에서 '{SS_METHODS[method].split(' (')[0]}'"
+        tag2 = f" -> 후보{POOL_N:,}개에서 '{SS_METHODS[method].split(' (')[0]}'" if method != 7 else f" -> 후보{POOL_N:,}개에서 {tag_lim}"
         print(f"\n  후보 {len(pool):,}개 중에서 고른 결과입니다.")
     else:
         tickets, ctx, core = make_tickets(game, row, n, rng, tuple(fixed), tuple(banned))
