@@ -1026,6 +1026,45 @@ def weekly(game, rows, picks_per=5):
     return summary
 
 
+# ---------------------------------------------------------------- 스마트 정리: 이상해 보이는 조합 거르기
+def run_max(c):
+    best = cur = 1
+    for a, b in zip(c, c[1:]):
+        cur = cur + 1 if b == a + 1 else 1
+        best = max(best, cur)
+    return best
+
+
+def smart_rules(draws, N):
+    """과거 당첨번호에서 흔한 모양만 남기는 규칙. 합 구간은 최근 300회의 5~95% 구간."""
+    s_ = sorted(sum(x[1]) for x in draws[-300:])
+    band = (s_[int(len(s_) * 0.05)], s_[int(len(s_) * 0.95)])
+    return [("연속 번호는 2개까지 (3,4,5 같은 3연속 금지)", lambda c: run_max(c) <= 2),
+            (f"합계 {band[0]}~{band[1]} (너무 작거나 큰 합 제외)", lambda c: band[0] <= sum(c) <= band[1]),
+            ("홀수 1~5개 (전부 홀수/짝수 제외)", lambda c: 1 <= sum(x % 2 for x in c) <= 5),
+            (f"낮은 번호(1~{N // 2}) 1~5개 (한쪽 쏠림 제외)", lambda c: 1 <= sum(x <= N // 2 for x in c) <= 5),
+            ("같은 끝자리 3개까지", lambda c: max(Counter(x % 10 for x in c).values()) <= 3),
+            ("같은 10단위 구간 3개까지", lambda c: max(Counter(x // 10 for x in c).values()) <= 3)]
+
+
+def smart_ok(c, rules):
+    return all(f(c) for _, f in rules)
+
+
+def show_smart_rules(game):
+    rules = smart_rules(game.draws, game.N)
+    rng = random.Random(11)
+    rnd = [tuple(sorted(rng.sample(range(1, game.N + 1), 6))) for _ in range(20000)]
+    hist = [x[1] for x in game.draws]
+    print(f"\n  ------ 스마트 정리 규칙 (이상해 보이는 조합을 미리 걸러 냅니다) ------")
+    print("  " + padr("규칙", 52) + padl("과거 당첨번호 통과", 20) + padl("무작위 조합 통과", 18))
+    for nm, f in rules:
+        print("  " + padr(nm, 52) + padl(f"{sum(f(c) for c in hist) / len(hist) * 100:.0f}%", 20) + padl(f"{sum(f(c) for c in rnd) / len(rnd) * 100:.0f}%", 18))
+    allp = lambda cs: sum(smart_ok(c, rules) for c in cs) / len(cs) * 100
+    print("  " + padr("전부 통과", 52) + padl(f"{allp(hist):.0f}%", 20) + padl(f"{allp(rnd):.0f}%", 18))
+    print("  * 과거 당첨번호와 무작위 조합이 거의 같은 비율로 통과합니다. 즉 이 규칙은 당첨번호를 따로 알아보지 못하고, 3연속 같은 '이상해 보이는' 모양만 정리해 줍니다. 당첨 확률은 그대로입니다.")
+
+
 # ---------------------------------------------------------------- 후보 1,000개 → 2차 선별 (옵션)
 POOL_N = 1000
 SS_METHODS = {
@@ -1040,24 +1079,30 @@ SS_METHODS = {
 }
 
 
-def candidate_pool(game, row, n, rng, i=None, fixed=(), banned=()):
+def candidate_pool(game, row, n, rng, i=None, fixed=(), banned=(), smart=False):
     """전략 조건을 만족하는 후보 n개(서로 겹침 제한 없음). i = 몇 번째 회차를 앞두고 뽑는가(기본: 다음 회차)."""
     d, N = game.draws, game.N
     i = len(d) if i is None else i
     ctx = context(d, i)
     past = {c for _, c, _, _ in d[:i]}
+    rules = smart_rules(d[:i], N) if smart else None
     if row["kind"] == "F":
         opts = [tuple(o) if o else None for o in row["opts"]]
         pool_nums = [x for x in range(1, N + 1) if x not in banned and x not in fixed]
-        out, tries = [], 0
+        out, seen, tries = [], set(), 0
         while len(out) < n and tries < 600000:
             tries += 1
             c = tuple(sorted(list(fixed) + rng.sample(pool_nums, 6 - len(fixed))))
-            if c not in past and passes(feat(c, ctx), opts):
+            if c not in past and c not in seen and passes(feat(c, ctx), opts) and (rules is None or smart_ok(c, rules)):
+                seen.add(c)
                 out.append(c)
         return out
     mode = next(x[2] for x in CORE_STRATEGIES if x[0] == row["id"])
-    return core_tickets(game, core_of(game, row["id"], i), ctx, sum_band(game, i), n, rng, mode, picks=picks_of(row["id"]), fixed=fixed, banned=banned, past=past, max_overlap=6)
+    out = core_tickets(game, core_of(game, row["id"], i), ctx, sum_band(game, i), n * (3 if smart else 1), rng, mode, picks=picks_of(row["id"]), fixed=fixed, banned=banned, past=past, max_overlap=6)
+    out = list(dict.fromkeys(out))
+    if rules is not None:
+        out = [c for c in out if smart_ok(c, rules)]
+    return out[:n]
 
 
 def seen_sets(draws):
@@ -1159,13 +1204,13 @@ def ss_tally(tk, win, bonus, amt, t):
                 t[3] += amt[rk - 1]
 
 
-def ss_recent(game, row, n, rounds=20, seed=4242, pool_n=None):
+def ss_recent(game, row, n, rounds=20, seed=4242, pool_n=None, smart=False):
     """최근 rounds 회 각각에서 '그 회차 이전 자료만으로' 후보 1,000개를 뽑고 방법별로 n장을 골랐을 때의 집계 {방법: [장수, 5등, 4등 이상, 당첨금]}"""
     d = game.draws
     rng = random.Random(seed)
     got = {k: [0, 0, 0, 0] for k in SS_ORDER}
     for i in range(len(d) - rounds, len(d)):
-        pool = candidate_pool(game, row, pool_n or POOL_N, rng, i=i)
+        pool = candidate_pool(game, row, pool_n or POOL_N, rng, i=i, smart=smart)
         if len(pool) < n:
             continue
         win, bonus, amt = d[i][1], d[i][2], d[i][3] if len(d[i]) > 3 else None
@@ -1184,13 +1229,13 @@ def fb_label(g):
     return "  ".join(f"{nm}{'-' if v is None else str(v) + '이하'}" for nm, v in zip(("삼중", "사중", "오중"), g))
 
 
-def ss_forbid_table(game, row, n, rounds=20, seed=5151, pool_n=None):
+def ss_forbid_table(game, row, n, rounds=20, seed=5151, pool_n=None, smart=False):
     """금지삼중·사중·오중 기준 30가지를 최근 rounds 회에 적용했을 때의 집계 {기준: [장수, 5등, 4등 이상, 당첨금]}"""
     d = game.draws
     rng = random.Random(seed)
     acc = {g: [0, 0, 0, 0] for g in FB_GRID}
     for i in range(len(d) - rounds, len(d)):
-        pool = candidate_pool(game, row, pool_n or POOL_N, rng, i=i)
+        pool = candidate_pool(game, row, pool_n or POOL_N, rng, i=i, smart=smart)
         if len(pool) < n:
             continue
         win, bonus, amt = d[i][1], d[i][2], d[i][3] if len(d[i]) > 3 else None
@@ -1485,6 +1530,10 @@ def pick_numbers(game, rows, shown):
     way = ask_int("선택", 1, 1, 2)
     rng = random.Random()
     method, limits, tag2 = 0, (None, None, None), ""
+    show_smart_rules(game)
+    print(f"\n   1  이상한 조합 거르기 (스마트 정리, 기본)")
+    print("   2  거르지 않기")
+    smart = ask_int("선택", 1, 1, 2) == 1
     if way == 2:
         try:
             sz = json.load(open(size_cache_path(game), encoding="utf-8"))
@@ -1500,7 +1549,7 @@ def pick_numbers(game, rows, shown):
             print(f"  후보가 뽑을 장수보다 적어 {POOL_N:,}개로 바꿉니다.")
             pool_n = POOL_N
         print(f"\n  최근 20회를 되돌려서 이 전략 + 각 선별 방법을 써 봤습니다. (회차마다 그때까지의 자료만 사용, 잠시 걸립니다)")
-        got = ss_recent(game, row, n, pool_n=pool_n)
+        got = ss_recent(game, row, n, pool_n=pool_n, smart=smart)
         print(f"  ------ 후보에서 어떤 기준으로 고를까요?  (최근 20회를 되돌려 회차마다 {n}장씩 골랐다면) ------")
         names = {**{str(k_): v for k_, v in SS_METHODS.items()}, **{k_: "  예) " + v[0] for k_, v in SS_PRESETS.items()}}
         print("       " + padr("방법", 52) + TALLY_HEAD)
@@ -1515,7 +1564,7 @@ def pick_numbers(game, rows, shown):
         method = ask_int("선택", 1, 1, 8)
         if method == 7:
             print(f"\n  기준 조합표를 만드는 중입니다. (최근 20회, 잠시 걸립니다)")
-            acc = ss_forbid_table(game, row, n, pool_n=pool_n)
+            acc = ss_forbid_table(game, row, n, pool_n=pool_n, smart=smart)
             show_fb_table(acc, n)
             print(f"\n  위 표에서 쓸 줄의 번호를 입력하세요. 0 을 입력하면 세 가지 기준을 직접 숫자로 정합니다.")
             pickno = ask_int("조합표 번호", 0, 0, len(FB_GRID))
@@ -1525,7 +1574,7 @@ def pick_numbers(game, rows, shown):
                 print("  기준을 숫자로 입력합니다. 상관없으면 그냥 엔터. (금지삼중 0~20, 금지사중 0~15, 금지오중 0~6)")
                 limits = (ask_opt_int("금지삼중이 최대 몇 개까지? (예: 2)", 0, 20), ask_opt_int("금지사중이 최대 몇 개까지? (예: 14)", 0, 15), ask_opt_int("금지오중이 최대 몇 개까지? (예: 5)", 0, 6))
             tag_lim = "금지 " + fb_label(limits)
-        pool = candidate_pool(game, row, pool_n, rng, fixed=tuple(fixed), banned=tuple(banned))
+        pool = candidate_pool(game, row, pool_n, rng, fixed=tuple(fixed), banned=tuple(banned), smart=smart)
         if len(pool) < n:
             print(f"  조건에 맞는 후보를 {len(pool)}개밖에 만들지 못했습니다. 조건을 줄이거나 바로 뽑기를 써 보세요.")
             return
@@ -1533,8 +1582,24 @@ def pick_numbers(game, rows, shown):
         ctx, core = context(game.draws, len(game.draws)), None
         if len(tickets) < n:
             print(f"  기준에 맞는 후보가 {len(tickets)}개뿐이라 그만큼만 보여 드립니다. 기준을 느슨하게 해 보세요.")
-        tag2 = f" -> 후보{pool_n:,}개에서 '{SS_METHODS[method].split(' (')[0]}'" if method != 7 else f" -> 후보{pool_n:,}개에서 {tag_lim}"
+        tag2 = (f" -> 후보{pool_n:,}개에서 '{SS_METHODS[method].split(' (')[0]}'" if method != 7 else f" -> 후보{pool_n:,}개에서 {tag_lim}") + (" + 스마트 정리" if smart else "")
         print(f"\n  후보 {len(pool):,}개 중에서 고른 결과입니다.")
+    elif smart:
+        pool = candidate_pool(game, row, max(400, n * 20), rng, fixed=tuple(fixed), banned=tuple(banned), smart=True)
+        tickets = []
+        for c in pool:   # 서로 4개 넘게 겹치지 않는 조합만 차례로
+            if all(len(set(c) & set(o)) <= 3 for o in tickets):
+                tickets.append(c)
+            if len(tickets) == n:
+                break
+        if len(tickets) < n:
+            for c in pool:
+                if c not in tickets and all(len(set(c) & set(o)) <= 4 for o in tickets):
+                    tickets.append(c)
+                if len(tickets) == n:
+                    break
+        ctx, core = context(game.draws, len(game.draws)), None
+        tag2 = " + 스마트 정리"
     else:
         tickets, ctx, core = make_tickets(game, row, n, rng, tuple(fixed), tuple(banned))
     row = dict(row, name=row["name"] + tag2) if tag2 else row
