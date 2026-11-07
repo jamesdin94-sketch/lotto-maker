@@ -25,7 +25,7 @@ from datetime import datetime
 from itertools import combinations
 from math import comb
 
-VERSION = "1.4"   # 구조가 바뀌면 앞자리(2.0), 전략·수치만 바뀌면 소수점(1.1). CHANGELOG.md 참고
+VERSION = "1.5"   # 구조가 바뀌면 앞자리(2.0), 전략·수치만 바뀌면 소수점(1.1). CHANGELOG.md 참고
 HERE = os.path.dirname(os.path.abspath(__file__))
 W = 10            # '최근' = 직전 10회
 SAMPLE = 2000     # 필터 격자 시뮬레이션: 회차마다 무작위 후보 수
@@ -405,6 +405,7 @@ def simulate(game, seed=2026):
     rng2 = random.Random(seed + 1)
     recent_pool = []      # 최근 RECENT 회차: (후보 [(특징, 등수)], 그 회차 등수별 1인당 당첨금)
     core_recent = {s[0]: {"n": 0, "c": [0] * 6, "money": 0} for s in CORE_STRATEGIES}
+    round_hist, core_wf = [], {s[0]: [] for s in CORE_STRATEGIES}   # 워크포워드용: 회차별 {특징: [장수, 5등+]}, 코어 전략의 회차별 [장수, 5등+]
     for k, i in enumerate(range(len(d) - ROUNDS, len(d))):
         part = 0 if k < SPLIT else 1
         ctx = context(d, i)
@@ -418,11 +419,16 @@ def simulate(game, seed=2026):
                 c = tuple(sorted(rng2.sample(range(1, N + 1), 6)))
                 pl.append((feat(c, ctx), rank_of(c, win, bonus)))
             recent_pool.append((pl, amt))
+        rh = {}
         for _ in range(SAMPLE):
             c = tuple(sorted(rng.sample(range(1, N + 1), 6)))
-            e = tbl.setdefault(feat(c, ctx), [0] * 7)
+            fk = feat(c, ctx)
+            e = tbl.setdefault(fk, [0] * 7)
             e[0] += 1
             r = rank_of(c, win, bonus)
+            q = rh.setdefault(fk, [0, 0])
+            q[0] += 1
+            q[1] += 1 if r else 0
             if r:
                 e[r] += 1
                 if r >= 3 and amt:
@@ -446,11 +452,13 @@ def simulate(game, seed=2026):
                 x[2] += 0 < r <= 4
                 x[3] += 0 < r <= 3
                 x[4] += amt[r - 1] if (r >= 3 and amt) else 0
+            core_wf[sid].append([x[0] - n0, x[1] - h0])
             if x[0] > n0:
                 core_rr[sid][part].append([x[0] - n0, x[1] - h0])   # 회차별 (장수, 5등+ 장수): 코어 전략은 장끼리 번호를 공유해 결과가 함께 움직이므로 z 를 회차 단위로 계산한다
+        round_hist.append(rh)
         if (k + 1) % 50 == 0:
             print(f"    시뮬레이션 {k + 1}/{ROUNDS} 회차 …")
-    return agg, core_res, win_marg, core_rr, core_sz, recent_pool, core_recent
+    return agg, core_res, win_marg, core_rr, core_sz, recent_pool, core_recent, round_hist, core_wf
 
 
 def recent_eval(recent_pool, opts):
@@ -470,7 +478,7 @@ def recent_eval(recent_pool, opts):
     return {"n": n, "c": c[1:], "money": money}
 
 
-SCHEMA = 6   # 캐시 형식 번호(필터 전략 ID 를 격자 번호로 고정, 코어 크기 기록)
+SCHEMA = 7   # 캐시 형식 번호(필터 전략 ID 를 격자 번호로 고정, 코어 크기 기록)
 
 
 def build_table(game):
@@ -484,7 +492,7 @@ def build_table(game):
         except Exception:
             pass
     print(f"  {game.name}: 전략을 과거 {ROUNDS}회로 시뮬레이션합니다 (약 1~2분, 이번 회차 동안 저장됩니다).")
-    agg, core_res, win_marg, core_rr, core_sz, recent_pool, core_recent = simulate(game)
+    agg, core_res, win_marg, core_rr, core_sz, recent_pool, core_recent, round_hist, core_wf = simulate(game)
     rnd_marg = [Counter() for _ in range(6)]
     for tbl in agg:
         for f, e in tbl.items():
@@ -511,6 +519,8 @@ def build_table(game):
                          "core_n": sum(sz) / len(sz) if sz else 0,
                          "rec": {"n": core_recent[sid]["n"], "c": core_recent[sid]["c"][1:], "money": core_recent[sid]["money"]}})
     json.dump({"last": last, "v": VERSION, "schema": SCHEMA, "rows": rows, "signals": signals}, open(game.cache, "w", encoding="utf-8"), ensure_ascii=False)
+    wf = make_wf(game, rows, round_hist, core_wf)
+    json.dump(wf, open(wf_path(game), "w", encoding="utf-8"), separators=(",", ":"))
     return rows
 
 
@@ -888,6 +898,164 @@ def pool_input_tickets(game, pool, opts, n, rng, i=None):
             continue
         out.append(c)
     return out, ctx
+
+
+# ---------------------------------------------------------------- 워크포워드 평가
+# 기준: 어떤 규칙으로 전략을 '그 시점까지의 성적'만 보고 고르고, 바로 다음 회차에서 실제로 어땠는지로만 평가한다(회차를 굴려 가며 반복).
+WF_KS = (30, 60, 100)   # 규칙이 보는 직전 회차 수
+
+
+def wf_path(game):
+    return os.path.join(HERE, f"wf_cache_{game.key}.json")
+
+
+def make_wf(game, rows, round_hist, core_wf):
+    """회차별 [장수, 5등+] 를 전략마다 저장한다(필터 전략은 회차별 특징 집계표에서 합산)."""
+    U = {}
+    for rh in round_hist:
+        for f in rh:
+            U.setdefault(f, len(U))
+    feats = [None] * len(U)
+    for f, i in U.items():
+        feats[i] = f
+    R = len(round_hist)
+    nr = [[0] * len(U) for _ in range(R)]
+    hr = [[0] * len(U) for _ in range(R)]
+    for t, rh in enumerate(round_hist):
+        for f, (n, h) in rh.items():
+            nr[t][U[f]] = n
+            hr[t][U[f]] = h
+    d = game.draws
+    out = {"rounds": [d[len(d) - R + t][0] for t in range(R)], "n": {}, "h": {}, "base_n": [sum(x) for x in nr], "base_h": [sum(x) for x in hr]}
+    for r in rows:
+        if r["kind"] == "F":
+            opts = [tuple(o) if o else None for o in r["opts"]]
+            ids = [i for i, f in enumerate(feats) if passes(f, opts)]
+            out["n"][r["id"]] = [sum(map(nr[t].__getitem__, ids)) for t in range(R)]
+            out["h"][r["id"]] = [sum(map(hr[t].__getitem__, ids)) for t in range(R)]
+        elif r["id"] in core_wf and eligible(r):
+            out["n"][r["id"]] = [x[0] for x in core_wf[r["id"]]]
+            out["h"][r["id"]] = [x[1] for x in core_wf[r["id"]]]
+    out["names"] = {r["id"]: r["name"] for r in rows if r["id"] in out["n"]}
+    return out
+
+
+def load_wf(game):
+    try:
+        w = json.load(open(wf_path(game), encoding="utf-8"))
+        return w if w.get("rounds") and w["rounds"][-1] == game.draws[-1][0] else None
+    except Exception:
+        return None
+
+
+def _prefix(v):
+    out = [0]
+    for x in v:
+        out.append(out[-1] + x)
+    return out
+
+
+def wf_best(wf, K, t, pn, ph, minn=3000):
+    """t 회차를 앞두고, 직전 K회(t-K ~ t-1)의 5등+률이 가장 높은 전략 (장수가 minn 미만이면 제외)."""
+    best = None
+    for i in pn:
+        N = pn[i][t] - pn[i][t - K]
+        if N < minn:
+            continue
+        r = (ph[i][t] - ph[i][t - K]) / N
+        if best is None or r > best[0]:
+            best = (r, i)
+    return best
+
+
+def wf_eval(wf, K, rng=None):
+    """규칙 '직전 K회 5등+률 1위 전략을 다음 회차에 쓴다' 의 워크포워드 결과: (회차별 초과 5등+률 차이 목록, 선택 전략 목록, 선택 당시 직전 K회 초과분 평균, 무작위 전략 선택 대조)"""
+    ids = list(wf["n"])
+    pn = {i: _prefix(wf["n"][i]) for i in ids}
+    ph = {i: _prefix(wf["h"][i]) for i in ids}
+    R = len(wf["rounds"])
+    diffs, picks, insamp, ctrl = [], [], [], []
+    rng = rng or random.Random(5)
+    for t in range(K, R):
+        b = wf_best(wf, K, t, pn, ph)
+        if not b:
+            continue
+        i = b[1]
+        nt = wf["n"][i][t]
+        bn = wf["base_n"][t]
+        if nt == 0 or bn == 0:
+            continue
+        base_t = wf["base_h"][t] / bn
+        diffs.append(wf["h"][i][t] / nt - base_t)
+        picks.append(i)
+        bw = (sum(wf["base_h"][t - K:t]) / max(1, sum(wf["base_n"][t - K:t])))
+        insamp.append(b[0] - bw)
+        j = rng.choice([x for x in ids if wf["n"][x][t] > 0])
+        ctrl.append(wf["h"][j][t] / wf["n"][j][t] - base_t)
+    return diffs, picks, insamp, ctrl
+
+
+def wf_stats(v):
+    m = sum(v) / len(v)
+    sd = (sum((x - m) ** 2 for x in v) / len(v)) ** 0.5
+    se = sd / len(v) ** 0.5 if sd else 1e-9
+    return m, se, m / se
+
+
+def wf_report(game, verbose=True):
+    wf = load_wf(game)
+    if not wf:
+        print("  워크포워드 자료가 없습니다. 메뉴 3 으로 최신 당첨번호를 받아 성적표를 다시 만든 뒤 보세요.")
+        return None
+    base = sum(wf["base_h"]) / max(1, sum(wf["base_n"]))
+    res = {}
+    if verbose:
+        print("\n  ===== 워크포워드 성적 (기준: 그 시점까지 자료로 고른 전략이 '다음 회차'에서 실제로 어땠나) =====")
+        print(f"  규칙: 매 회차마다 직전 K회에서 5등 이상 비율이 가장 높았던 전략(전략 {len(wf['n'])}개 중)을 골라 바로 다음 회차에서 씁니다. 무작위 조합의 5등 이상 비율은 {base:.2%} 입니다.")
+        print("  " + padr("직전 K회", 10) + padl("시험 회차", 10) + padl("고를 때 성적", 16) + padl("다음 회차 성적(실제)", 24) + padl("t 값", 8) + padl("무작위 전략 대조", 18))
+    for K in WF_KS:
+        diffs, picks, insamp, ctrl = wf_eval(wf, K)
+        if len(diffs) < 20:
+            continue
+        m, se, t = wf_stats(diffs)
+        mi = sum(insamp) / len(insamp)
+        mc, _, tc = wf_stats(ctrl)
+        res[K] = (len(diffs), mi / base, m / base, t, mc / base, len(set(picks)))
+        if verbose:
+            print("  " + padr(f"{K}회", 10) + padl(str(len(diffs)), 10) + padl(f"{mi / base:+.0%}", 16) + padl(f"{m / base:+.1%} (±{se / base:.1%})", 24) + padl(f"{t:+.1f}", 8) + padl(f"{mc / base:+.1%}", 18))
+    if verbose and res:
+        print("  * '고를 때 성적'은 전략을 고른 시점에 보이던 무작위 대비 초과분이고, '다음 회차 성적'이 실제로 얻은 초과분입니다. t 값이 ±2 안이면 우연과 구분되지 않습니다(±3 이상이어야 믿습니다).")
+        print("  * 고를 때는 좋아 보여도 다음 회차에서 사라지는 것이 일반적이며, 사라진 만큼이 '과거에 맞춘' 효과입니다.")
+    return res
+
+
+def wf_pick_row(game, rows, K=100):
+    """워크포워드 규칙이 지금 고르는 전략(직전 K회 5등+률 1위)과 그 규칙의 과거 워크포워드 t 값"""
+    wf = load_wf(game)
+    if not wf:
+        return None, None
+    ids = list(wf["n"])
+    pn = {i: _prefix(wf["n"][i]) for i in ids}
+    ph = {i: _prefix(wf["h"][i]) for i in ids}
+    b = wf_best(wf, K, len(wf["rounds"]), pn, ph)
+    if not b:
+        return None, None
+    row = next((r for r in rows if r["id"] == b[1]), None)
+    diffs = wf_eval(wf, K)[0]
+    return row, (wf_stats(diffs)[2] if len(diffs) >= 20 else None)
+
+
+def wf_line(game):
+    wf = load_wf(game)
+    if not wf:
+        return
+    base = sum(wf["base_h"]) / max(1, sum(wf["base_n"]))
+    diffs = wf_eval(wf, 100)[0]
+    if len(diffs) < 20:
+        return
+    m, se, t = wf_stats(diffs)
+    verdict = "우연과 구분되지 않음" if abs(t) < 2 else ("무작위보다 나음" if t > 0 else "무작위보다 못함")
+    print(f"\n  ※ 워크포워드 점검: 직전 100회 1위 전략을 다음 회차에 쓰는 규칙의 최근 {len(diffs)}회 성적은 무작위 대비 {m / base:+.1%} (t {t:+.1f}) → {verdict}. 자세히는 메뉴 6.")
 
 
 # ---------------------------------------------------------------- 주간 분석: 지난주 성적 → 부진 전략 정리 → 이번 주 추천 → 누적 기록
@@ -1588,8 +1756,9 @@ def pick_numbers(game, rows, shown):
     print("   3  @ 표시(300회 동안 안정적이었던) 전략으로 자동으로")
     print("   4  조건(쌍, 핫, 콜드 등)을 내가 직접 정해서")
     print("   5  다른 곳에서 받은 25개 번호 안에서만 고르기")
+    print("   6  워크포워드 규칙(직전 100회 1위)이 지금 고르는 전략으로 자동으로")
     print("   0  돌아가기")
-    ch = ask_int("선택", 1, 0, 5)
+    ch = ask_int("선택", 1, 0, 6)
     if ch == 0:
         return
     nxt = game.draws[-1][0] + 1
@@ -1619,6 +1788,13 @@ def pick_numbers(game, rows, shown):
         row = recent_best(rows)
     elif ch == 3:
         row = recommended(rows, p5)
+    elif ch == 6:
+        row, tv = wf_pick_row(game, rows)
+        if row is None:
+            print("  워크포워드 자료가 없어 표의 추천 전략으로 대신합니다.")
+            row = recommended(rows, p5)
+        else:
+            print(f"  워크포워드 규칙이 고른 전략: {row['name']}" + (f"  (이 규칙의 과거 워크포워드 t 값 {tv:+.1f}, ±2 안이면 우연과 구분되지 않음)" if tv is not None else ""))
     else:
         k = ask_int(f"표의 번호 (1~{len(shown) - 1}, 0은 비교용 무작위)", 1, 0, len(shown) - 1)
         row = shown[k]
@@ -1758,6 +1934,7 @@ def main():
     print("  ※ 사용법: 숫자를 입력하고 엔터(Enter) 키를 누르세요. 그냥 엔터만 누르면 [ ] 안의 숫자가 선택됩니다.")
     key_sort = "6"
     shown = show_table(game, rows, key_sort)
+    wf_line(game)
     while True:
         print("\n  ------ 무엇을 할까요? ------")
         print("   1  번호 뽑기")
@@ -1765,8 +1942,9 @@ def main():
         print("   3  최신 당첨번호 받기 (추첨한 다음 날 한 번)")
         print("   4  내가 뽑아 둔 번호의 당첨 결과 보기")
         print("   5  더 자세한 분석 (암호키, 신호, 주간 분석, 25수 풀)")
+        print("   6  워크포워드 성적 (전략을 고르는 규칙이 다음 회차에서 실제로 통했나)")
         print("   0  끝내기")
-        m = ask_int("메뉴", 1, 0, 5)
+        m = ask_int("메뉴", 1, 0, 6)
         if m == 0:
             break
         if m == 1:
@@ -1787,6 +1965,8 @@ def main():
             shown = show_table(game, rows, key_sort)
         elif m == 4:
             check_picks(game)
+        elif m == 6:
+            wf_report(game)
         elif m == 5:
             print("\n  1  암호키 신뢰도    2  신호 분석    3  주간 분석 (금요일에 한 번)    4  25수 풀 분석    5  후보 1,000개 -> 2차 선별 시험    6  1차 후보 수 x 2차 장수 시뮬레이션    0  돌아가기")
             k = ask_int("선택", 0, 0, 6)
