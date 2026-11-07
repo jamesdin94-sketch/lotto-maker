@@ -25,7 +25,7 @@ from datetime import datetime
 from itertools import combinations
 from math import comb
 
-VERSION = "1.3"   # 구조가 바뀌면 앞자리(2.0), 전략·수치만 바뀌면 소수점(1.1). CHANGELOG.md 참고
+VERSION = "1.4"   # 구조가 바뀌면 앞자리(2.0), 전략·수치만 바뀌면 소수점(1.1). CHANGELOG.md 참고
 HERE = os.path.dirname(os.path.abspath(__file__))
 W = 10            # '최근' = 직전 10회
 SAMPLE = 2000     # 필터 격자 시뮬레이션: 회차마다 무작위 후보 수
@@ -1236,16 +1236,19 @@ def diverse_pick(pool, k):
     return chosen
 
 
-def cap_use(ordered, n, cap=None):
-    """순서대로 장을 고르되 한 번호가 cap 장을 넘게 쓰이지 않게 한다(기본: 평균 사용 횟수의 2배, 10장 미만이면 제한 없음).
-    조건에 맞는 장이 모자라면 남은 칸은 순서대로 채운다. 확률을 높이는 것이 아니라 번호가 한쪽에 몰리는 것을 막는다."""
+def cap_use(ordered, n, cap=None, max_ov=2):
+    """순서대로 장을 고르되 ① 한 번호가 cap 장을 넘게 쓰이지 않게(기본: 평균 사용 횟수의 2배) ② 이미 고른 장과 max_ov 개를 넘게 겹치지 않게 한다.
+    10장 미만이면 제한하지 않는다. 조건에 맞는 장이 모자라면 남은 칸은 순서대로 채운다.
+    당첨 확률(기댓값)을 높이는 것이 아니라, 장끼리 겹침을 줄여 '한 장이라도 3개 이상 맞는 회차'가 더 자주 나오게 하는 것이다(최근 300회 시험: 사용자 방식 37.7% → 48.7%, 무작위 52.7%)."""
     if cap is None:
         cap = max(3, -(-n * 6 * 2 // 45)) if n >= 10 else 99
+    if n < 10:
+        max_ov = 6
     use, out = Counter(), []
     for c in ordered:
         if len(out) >= n:
             break
-        if all(use[x] < cap for x in c):
+        if all(use[x] < cap for x in c) and all(len(set(c) & set(o)) <= max_ov for o in out):
             out.append(c)
             use.update(c)
     for c in ordered:
