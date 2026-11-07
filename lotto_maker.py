@@ -24,7 +24,7 @@ from collections import Counter
 from itertools import combinations
 from math import comb
 
-VERSION = "1.1"   # 구조가 바뀌면 앞자리(2.0), 전략·수치만 바뀌면 소수점(1.1). CHANGELOG.md 참고
+VERSION = "1.2"   # 구조가 바뀌면 앞자리(2.0), 전략·수치만 바뀌면 소수점(1.1). CHANGELOG.md 참고
 HERE = os.path.dirname(os.path.abspath(__file__))
 W = 10            # '최근' = 직전 10회
 SAMPLE = 2000     # 필터 격자 시뮬레이션: 회차마다 무작위 후보 수
@@ -315,7 +315,10 @@ def core_tickets(game, core, ctx, band, n, rng, mode, picks=(3, 4, 5), fixed=(),
         c = tuple(sorted(base + rng.sample([x for x in supp if x not in base], need)))
         if c in past:
             continue
-        if mode != "none":
+        if mode in HYB_OPTS:
+            if not passes(feat(c, ctx), HYB_OPTS[mode]):
+                continue
+        elif mode != "none":
             f = feat(c, ctx)
             if mode == "enigma" and not (f[1] >= 1 and 8 <= f[4] <= 14 and band[0] <= sum(c) <= band[1] and f[5] <= 2):
                 continue
@@ -358,6 +361,15 @@ CORE_STRATEGIES += [(f"E{i + 3}", f"암호키 {CIPHER_KO[name]} 코어 + 조건"
 CORE_STRATEGIES += [("A1", "인공지능 코어12 + 쌍=0·분산 9~13·합·겹침≤1", "ai", "", (3, 4)), ("A2", "인공지능 코어12 (조건 없음)", "none", "", (3, 4)),
                     ("P1", "25수 풀: 직전·자주 나온 번호 빼고 풀 안에서만", "none", "pool1", (6,)), ("P2", "25수 풀: 안 나온 번호 빼고 풀 안에서만", "none", "pool2", (6,)),
                     ("P3", "25수 풀: 무작위 풀 안에서만 (비교용)", "none", "pool3", (6,))]
+
+
+# H 가족: 암호키(애니그마) 코어에서 만든 조합 중, 일반 필터 조건(쌍·핫·콜드·분산·겹침)도 통과하는 것만 쓰는 하이브리드
+HYB_OPTS = {"hybA": [(1, 2), None, None, None, (9, 13), (0, 1)], "hybB": [(1, 2), None, (0, 1), (0, 2), None, (0, 1)]}
+HYB_TXT = {"hybA": "쌍1~2 분9~13 겹0~1", "hybB": "쌍1~2 핫0~1 콜0~2 겹0~1"}
+_ci = [("top", "상위5")] + [(nm, CIPHER_KO[nm]) for nm in make_ciphers(45)]
+for _k, (_spec, _ko) in enumerate(_ci):
+    for _j, _m in enumerate(("hybA", "hybB")):
+        CORE_STRATEGIES.append((f"H{_k * 2 + _j + 1}", f"하이브리드: 암호키 {_ko} 코어 + 일반 필터({HYB_TXT[_m]})", _m, _spec, (3, 4, 5)))
 
 
 def core_of(game, sid, i, memo=None):
@@ -457,7 +469,7 @@ def recent_eval(recent_pool, opts):
     return {"n": n, "c": c[1:], "money": money}
 
 
-SCHEMA = 5   # 캐시 형식 번호(필터 전략 ID 를 격자 번호로 고정, 코어 크기 기록)
+SCHEMA = 6   # 캐시 형식 번호(필터 전략 ID 를 격자 번호로 고정, 코어 크기 기록)
 
 
 def build_table(game):
@@ -566,7 +578,7 @@ def recommended(rows, p5):
 
 
 SHORT_TAG = {"쌍": "쌍", "삼중": "삼", "핫": "핫", "콜드": "콜", "분산": "분", "겹침": "겹"}
-CORE_SHORT = {"E1": "암호키 상위5 코어", "E2": "암호키 상위5 (조건 없음)", "A1": "인공지능 코어12", "A2": "인공지능 코어12 (조건 없음)",
+CORE_SHORT = {**{f"H{_k * 2 + _j + 1}": f"혼합 {_ko} {('쌍분겹', '쌍핫콜겹')[_j]}" for _k, (_spec, _ko) in enumerate(_ci) for _j in (0, 1)}, "E1": "암호키 상위5 코어", "E2": "암호키 상위5 (조건 없음)", "A1": "인공지능 코어12", "A2": "인공지능 코어12 (조건 없음)",
               "P1": "25수 풀 (직전 번호 뺌)", "P2": "25수 풀 (안 나온 번호 뺌)", "P3": "25수 풀 (무작위 풀)"}
 
 
@@ -623,7 +635,7 @@ def show_table(game, rows, key, top=30):
     print(f"  * '최근 {RECENT}회' = 최근 {RECENT}번의 추첨마다 그 전략으로 {RECENT_TICKETS}장씩({RECENT * RECENT_TICKETS:,}장) 뽑아 실제 당첨번호와 맞춰 본 결과입니다.")
     print(f"  * 맨 왼쪽 '번호'를 기억했다가 아래 메뉴 1(번호 뽑기)에서 그 번호를 입력하면 됩니다.")
     print("  " + padl("번호", 4) + "  " + padr("전략(조건)", 30) + "| " + padl("당첨", 4) + padl("5등", 5) + padl("4등", 5) + padl("3등", 5) + padl("1,2등", 6) + padl("당첨금(원)", 12) + " | " + padr("300회(앞/뒤)", 13) + padl("점수", 6))
-    extras = sorted([r for r in rows if r["kind"] in ("E", "A", "P") and r not in best], key=lambda r: (r["kind"] != "E", r["kind"], int(r["id"][1:])))   # 암호키·AI·25수 풀 전략은 순위와 상관없이 항상 보여 준다
+    extras = sorted([r for r in rows if r["kind"] in ("E", "H", "A", "P") and r not in best], key=lambda r: ("EHAP".index(r["kind"]), int(r["id"][1:])))   # 암호키·AI·25수 풀 전략은 순위와 상관없이 항상 보여 준다
     shown = [base] + best + extras
 
     def line(n_, mark, r):
@@ -635,7 +647,7 @@ def show_table(game, rows, key, top=30):
                 + padl(mon, 12) + " | " + padr(f"{rate(r, 'sel') * 100:.2f}/{rate(r, 'ver') * 100:.2f}", 13) + padl(sc_, 6))
     for n, r in enumerate(shown):
         if extras and r is extras[0]:
-            print("  --- 암호키(애니그마)·AI·25수 풀 전략 (순위와 상관없이 항상 표시. 번호로 고르는 방법은 위와 같음) ---")
+            print("  --- 암호키(애니그마) · 하이브리드(암호키 + 일반 필터) · AI · 25수 풀 전략 (순위와 상관없이 항상 표시. 혼합 = 하이브리드) ---")
         print(line(n, "*" if r is star else "@" if r is diamond else " ", r))
     for mk, r, how in (("*", star, 2), ("@", diamond, 3)):   # 정렬 때문에 목록에 없는 * · @ 전략도 아래에 보여 준다(메뉴 1 -> 2 또는 3 으로 선택)
         if r not in shown:
@@ -818,7 +830,7 @@ def pool_input_tickets(game, pool, opts, n, rng, i=None):
 
 
 # ---------------------------------------------------------------- 주간 분석: 지난주 성적 → 부진 전략 정리 → 이번 주 추천 → 누적 기록
-NEW_IN_VERSION = {"P1": "25수 풀 전략", "P2": "25수 풀 전략", "P3": "25수 풀 비교용"}   # 이번 버전에서 보완·추가한 전략
+NEW_IN_VERSION = {"P1": "25수 풀 전략", "P2": "25수 풀 전략", "P3": "25수 풀 비교용", "H1": "하이브리드(암호키 코어 + 일반 필터) H1~H20"}   # 이번 버전에서 보완·추가한 전략
 
 
 def ledger_path(game):
@@ -1147,13 +1159,13 @@ def ss_tally(tk, win, bonus, amt, t):
                 t[3] += amt[rk - 1]
 
 
-def ss_recent(game, row, n, rounds=20, seed=4242):
+def ss_recent(game, row, n, rounds=20, seed=4242, pool_n=None):
     """최근 rounds 회 각각에서 '그 회차 이전 자료만으로' 후보 1,000개를 뽑고 방법별로 n장을 골랐을 때의 집계 {방법: [장수, 5등, 4등 이상, 당첨금]}"""
     d = game.draws
     rng = random.Random(seed)
     got = {k: [0, 0, 0, 0] for k in SS_ORDER}
     for i in range(len(d) - rounds, len(d)):
-        pool = candidate_pool(game, row, POOL_N, rng, i=i)
+        pool = candidate_pool(game, row, pool_n or POOL_N, rng, i=i)
         if len(pool) < n:
             continue
         win, bonus, amt = d[i][1], d[i][2], d[i][3] if len(d[i]) > 3 else None
@@ -1172,13 +1184,13 @@ def fb_label(g):
     return "  ".join(f"{nm}{'-' if v is None else str(v) + '이하'}" for nm, v in zip(("삼중", "사중", "오중"), g))
 
 
-def ss_forbid_table(game, row, n, rounds=20, seed=5151):
+def ss_forbid_table(game, row, n, rounds=20, seed=5151, pool_n=None):
     """금지삼중·사중·오중 기준 30가지를 최근 rounds 회에 적용했을 때의 집계 {기준: [장수, 5등, 4등 이상, 당첨금]}"""
     d = game.draws
     rng = random.Random(seed)
     acc = {g: [0, 0, 0, 0] for g in FB_GRID}
     for i in range(len(d) - rounds, len(d)):
-        pool = candidate_pool(game, row, POOL_N, rng, i=i)
+        pool = candidate_pool(game, row, pool_n or POOL_N, rng, i=i)
         if len(pool) < n:
             continue
         win, bonus, amt = d[i][1], d[i][2], d[i][3] if len(d[i]) > 3 else None
@@ -1205,6 +1217,64 @@ def show_fb_table(acc, n, rounds=20):
     for k, g in enumerate(FB_GRID, 1):
         print("  " + padl(str(k), 4) + "  " + "".join(padr("제한 없음" if v is None else f"{v}개 이하", 10) for v in g) + tally_cells(acc[g]))
     print("  * 뽑은장 = 기준을 통과한 후보가 모자라서 n장을 못 채운 회차가 있으면 그만큼 적게 뽑힌 것입니다. 당첨 = 5등 이상 장수.")
+
+
+SIZE_POOLS = (30, 100, 300, 1000, 3000)
+SIZE_PICKS = (5, 10, 20)
+SIZE_METHODS = (("8", "무작위로"), ("5", "금지삼중 적은 순"), ("3", "쌍 점수 높은 순"))
+
+
+def size_cache_path(game):
+    return os.path.join(HERE, f"second_stage_size_{game.key}.json")
+
+
+def size_experiment(game, rows, rounds=100, seed=909):
+    """1차 후보 수(30~3,000개) × 2차 장수(5·10·20장) × 선별 방법별로, 최근 rounds 회의 당첨 집계를 낸다. 전략: ◆ 안정 추천(없으면 비교용)."""
+    d = game.draws
+    p5 = p5_of(game.N)
+    row = recommended(rows, p5)
+    rng = random.Random(seed)
+    acc = {f"{pn}|{n}|{m}": [0, 0, 0, 0] for pn in SIZE_POOLS for n in SIZE_PICKS for m, _ in SIZE_METHODS}
+    for i in range(len(d) - rounds, len(d)):
+        win, bonus, amt = d[i][1], d[i][2], d[i][3] if len(d[i]) > 3 else None
+        st = ss_context(d[:i])
+        big = candidate_pool(game, row, max(SIZE_POOLS), rng, i=i)
+        if len(big) < max(SIZE_POOLS) // 2:
+            continue
+        for pn in SIZE_POOLS:
+            pool = big[:pn]
+            for n in SIZE_PICKS:
+                if len(pool) < n:
+                    continue
+                for m, _ in SIZE_METHODS:
+                    ss_tally(ss_select(pool, int(m), n, rng, st), win, bonus, amt, acc[f"{pn}|{n}|{m}"])
+        if (i - (len(d) - rounds) + 1) % 25 == 0:
+            print(f"     {i - (len(d) - rounds) + 1}/{rounds} 회차 …")
+    out = {"last": d[-1][0], "rounds": rounds, "strategy": row["name"], "acc": acc}
+    json.dump(out, open(size_cache_path(game), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    return out
+
+
+def show_size_table(out):
+    acc = out["acc"]
+    print(f"\n  ------ 1차 후보 수 x 2차 장수 시뮬레이션 (전략: {short_name_of(out['strategy'])}, 최근 {out['rounds']}회, 회차마다 그 이전 자료만 사용) ------")
+    print("  1차 = 전략으로 후보를 몇 개 뽑는가 / 2차 = 그중 몇 장을 고르는가. 칸의 숫자 = 당첨(5등 이상 장수) / 4등이상 / 당첨금(만 원)")
+    head = "  " + padl("1차 후보", 8) + padl("2차 장수", 9) + "".join(padl(nm, 24) for _, nm in SIZE_METHODS)
+    print(head)
+    for pn in SIZE_POOLS:
+        for n in SIZE_PICKS:
+            line = "  " + padl(f"{pn:,}개", 8) + padl(f"{n}장", 9)
+            for m, _ in SIZE_METHODS:
+                t = acc.get(f"{pn}|{n}|{m}", [0, 0, 0, 0])
+                line += padl(f"{t[1] + t[2]} / {t[2]} / {t[3] // 10000:,}", 24)
+            print(line)
+    tot = out["rounds"] * 20
+    print(f"  * 같은 칸끼리는 장수가 같아서 비교할 수 있습니다. 20장 칸은 {tot:,}장이라 우연의 폭이 약 +-{(tot * 0.024) ** 0.5:.0f}번입니다. 이보다 작은 차이는 의미가 없습니다.")
+    print("  * 당첨금은 3등(150만 원대) 한두 번에 크게 달라집니다. 당첨 횟수를 먼저 보고, 당첨금은 참고만 하세요.")
+
+
+def short_name_of(name):
+    return name.replace(" + ", " ")
 
 
 def ss_cache_path(game):
@@ -1416,8 +1486,21 @@ def pick_numbers(game, rows, shown):
     rng = random.Random()
     method, limits, tag2 = 0, (None, None, None), ""
     if way == 2:
+        try:
+            sz = json.load(open(size_cache_path(game), encoding="utf-8"))
+        except Exception:
+            sz = None
+        if sz:
+            show_size_table(sz)
+        print(f"\n  1차: 전략으로 후보를 몇 개 만들까요? (많을수록 오래 걸립니다)")
+        for k_, v_ in enumerate(SIZE_POOLS, 1):
+            print(f"   {k_}  {v_:,}개" + ("   (기본)" if v_ == POOL_N else ""))
+        pool_n = SIZE_POOLS[ask_int("선택", SIZE_POOLS.index(POOL_N) + 1, 1, len(SIZE_POOLS)) - 1]
+        if pool_n < n:
+            print(f"  후보가 뽑을 장수보다 적어 {POOL_N:,}개로 바꿉니다.")
+            pool_n = POOL_N
         print(f"\n  최근 20회를 되돌려서 이 전략 + 각 선별 방법을 써 봤습니다. (회차마다 그때까지의 자료만 사용, 잠시 걸립니다)")
-        got = ss_recent(game, row, n)
+        got = ss_recent(game, row, n, pool_n=pool_n)
         print(f"  ------ 후보에서 어떤 기준으로 고를까요?  (최근 20회를 되돌려 회차마다 {n}장씩 골랐다면) ------")
         names = {**{str(k_): v for k_, v in SS_METHODS.items()}, **{k_: "  예) " + v[0] for k_, v in SS_PRESETS.items()}}
         print("       " + padr("방법", 52) + TALLY_HEAD)
@@ -1432,7 +1515,7 @@ def pick_numbers(game, rows, shown):
         method = ask_int("선택", 1, 1, 8)
         if method == 7:
             print(f"\n  기준 조합표를 만드는 중입니다. (최근 20회, 잠시 걸립니다)")
-            acc = ss_forbid_table(game, row, n)
+            acc = ss_forbid_table(game, row, n, pool_n=pool_n)
             show_fb_table(acc, n)
             print(f"\n  위 표에서 쓸 줄의 번호를 입력하세요. 0 을 입력하면 세 가지 기준을 직접 숫자로 정합니다.")
             pickno = ask_int("조합표 번호", 0, 0, len(FB_GRID))
@@ -1442,7 +1525,7 @@ def pick_numbers(game, rows, shown):
                 print("  기준을 숫자로 입력합니다. 상관없으면 그냥 엔터. (금지삼중 0~20, 금지사중 0~15, 금지오중 0~6)")
                 limits = (ask_opt_int("금지삼중이 최대 몇 개까지? (예: 2)", 0, 20), ask_opt_int("금지사중이 최대 몇 개까지? (예: 14)", 0, 15), ask_opt_int("금지오중이 최대 몇 개까지? (예: 5)", 0, 6))
             tag_lim = "금지 " + fb_label(limits)
-        pool = candidate_pool(game, row, POOL_N, rng, fixed=tuple(fixed), banned=tuple(banned))
+        pool = candidate_pool(game, row, pool_n, rng, fixed=tuple(fixed), banned=tuple(banned))
         if len(pool) < n:
             print(f"  조건에 맞는 후보를 {len(pool)}개밖에 만들지 못했습니다. 조건을 줄이거나 바로 뽑기를 써 보세요.")
             return
@@ -1450,7 +1533,7 @@ def pick_numbers(game, rows, shown):
         ctx, core = context(game.draws, len(game.draws)), None
         if len(tickets) < n:
             print(f"  기준에 맞는 후보가 {len(tickets)}개뿐이라 그만큼만 보여 드립니다. 기준을 느슨하게 해 보세요.")
-        tag2 = f" -> 후보{POOL_N:,}개에서 '{SS_METHODS[method].split(' (')[0]}'" if method != 7 else f" -> 후보{POOL_N:,}개에서 {tag_lim}"
+        tag2 = f" -> 후보{pool_n:,}개에서 '{SS_METHODS[method].split(' (')[0]}'" if method != 7 else f" -> 후보{pool_n:,}개에서 {tag_lim}"
         print(f"\n  후보 {len(pool):,}개 중에서 고른 결과입니다.")
     else:
         tickets, ctx, core = make_tickets(game, row, n, rng, tuple(fixed), tuple(banned))
@@ -1532,8 +1615,8 @@ def main():
         elif m == 4:
             check_picks(game)
         elif m == 5:
-            print("\n  1  암호키 신뢰도    2  신호 분석    3  주간 분석 (금요일에 한 번)    4  25수 풀 분석    5  후보 1,000개 -> 2차 선별 시험    0  돌아가기")
-            k = ask_int("선택", 0, 0, 5)
+            print("\n  1  암호키 신뢰도    2  신호 분석    3  주간 분석 (금요일에 한 번)    4  25수 풀 분석    5  후보 1,000개 -> 2차 선별 시험    6  1차 후보 수 x 2차 장수 시뮬레이션    0  돌아가기")
+            k = ask_int("선택", 0, 0, 6)
             if k == 1:
                 show_ciphers(game)
             elif k == 2:
@@ -1542,6 +1625,18 @@ def main():
                 weekly(game, all_rows)
             elif k == 4:
                 pool_report(game)
+            elif k == 6:
+                try:
+                    sz = json.load(open(size_cache_path(game), encoding="utf-8"))
+                except Exception:
+                    sz = None
+                if sz is None:
+                    print("  처음 한 번 계산합니다. 몇 분 걸립니다.")
+                    sz = size_experiment(game, all_rows)
+                show_size_table(sz)
+                print(f"\n  1  다시 계산하기 (몇 분)    0  돌아가기")
+                if ask_int("선택", 0, 0, 1) == 1:
+                    show_size_table(size_experiment(game, all_rows))
             elif k == 5:
                 saved = None
                 try:
