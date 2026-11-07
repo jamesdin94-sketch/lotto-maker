@@ -17,6 +17,7 @@ import json
 import os
 import random
 import sys
+import unicodedata
 import urllib.request
 import zlib
 from collections import Counter
@@ -93,6 +94,31 @@ class Game:
         self.draws = [(i + 1, tuple(sorted(int(x) for x in r["winning_numbers"].split())), int(r["bonus"]), None) for i, r in enumerate(rows)]
 
 
+def dw(t):
+    """화면에서 차지하는 칸 수(한글·전각 문자는 2칸)."""
+    return sum(2 if unicodedata.east_asian_width(c) in "WFA" else 1 for c in t)
+
+
+def padr(t, w):
+    return t + " " * max(0, w - dw(t))
+
+
+def padl(t, w):
+    return " " * max(0, w - dw(t)) + t
+
+
+def cut(t, w):
+    """화면 칸 수 w 안에 들어가게 자른다."""
+    if dw(t) <= w:
+        return t
+    out, n = "", 0
+    for c in t:
+        if n + dw(c) > w - 1:
+            break
+        out, n = out + c, n + dw(c)
+    return out + "~"
+
+
 # ---------------------------------------------------------------- 번호의 특징 (기존 build_ctx / combo_stats 와 같은 정의)
 def context(draws, i):
     """i번째 회차 직전 W회: 쌍(FP)·삼중(FT) 집합, 번호 빈도, 직전 당첨번호"""
@@ -131,7 +157,7 @@ COLD_OPT = [(0, 0), (0, 1), (0, 2), None]
 AC_OPT = [(8, 11), (9, 13), (7, 15), None]
 OV_OPT = [(0, 1), None]
 SPACES = (FP_OPT, FT_OPT, HOT_OPT, COLD_OPT, AC_OPT, OV_OPT)
-LAB = ("쌍", "삼중", "핫", "콜드", "AC", "겹침")
+LAB = ("쌍", "삼중", "핫", "콜드", "분산", "겹침")
 
 
 def tag(name, o):
@@ -326,11 +352,12 @@ def pool_of(game, kind, i):
     return {n for n in range(1, N + 1) if n not in drop}
 
 
-CORE_STRATEGIES = [("E1", "Enigma 상위5 코어 + FT≥1·AC·합·겹침≤2", "enigma", "top", (3, 4, 5)), ("E2", "Enigma 상위5 코어 (필터 없음)", "none", "top", (3, 4, 5))]
-CORE_STRATEGIES += [(f"E{i + 3}", f"Enigma {name} 코어 + 필터", "enigma", name, (3, 4, 5)) for i, name in enumerate(make_ciphers(45))]
-CORE_STRATEGIES += [("A1", "AI 코어12 + 쌍=0·AC 9~13·합·겹침≤1", "ai", "", (3, 4)), ("A2", "AI 코어12 (필터 없음)", "none", "", (3, 4)),
-                    ("P1", "풀(25수): 직전·과출현 제외 후 풀 안에서만", "none", "pool1", (6,)), ("P2", "풀(25수): 콜드 제외 후 풀 안에서만", "none", "pool2", (6,)),
-                    ("P3", "풀(25수): 무작위 풀 안에서만 (대조군)", "none", "pool3", (6,))]
+CORE_STRATEGIES = [("E1", "암호키 상위5 코어 + 삼중≥1·분산·합·겹침≤2", "enigma", "top", (3, 4, 5)), ("E2", "암호키 상위5 코어 (조건 없음)", "none", "top", (3, 4, 5))]
+CIPHER_KO = {"ROT+1": "이동+1", "ROT+2": "이동+2", "MIRROR": "거울", "SUM": "합계", "DIFF": "차이", "BONUS": "보너스", "SWAP": "교환", "GAP": "간격", "XOR": "배타합"}
+CORE_STRATEGIES += [(f"E{i + 3}", f"암호키 {CIPHER_KO[name]} 코어 + 조건", "enigma", name, (3, 4, 5)) for i, name in enumerate(make_ciphers(45))]
+CORE_STRATEGIES += [("A1", "인공지능 코어12 + 쌍=0·분산 9~13·합·겹침≤1", "ai", "", (3, 4)), ("A2", "인공지능 코어12 (조건 없음)", "none", "", (3, 4)),
+                    ("P1", "25수 풀: 직전·자주 나온 번호 빼고 풀 안에서만", "none", "pool1", (6,)), ("P2", "25수 풀: 안 나온 번호 빼고 풀 안에서만", "none", "pool2", (6,)),
+                    ("P3", "25수 풀: 무작위 풀 안에서만 (비교용)", "none", "pool3", (6,))]
 
 
 def core_of(game, sid, i, memo=None):
@@ -430,7 +457,7 @@ def recent_eval(recent_pool, opts):
     return {"n": n, "c": c[1:], "money": money}
 
 
-SCHEMA = 4   # 캐시 형식 번호(필터 전략 ID 를 격자 번호로 고정, 코어 크기 기록)
+SCHEMA = 5   # 캐시 형식 번호(필터 전략 ID 를 격자 번호로 고정, 코어 크기 기록)
 
 
 def build_table(game):
@@ -538,6 +565,25 @@ def recommended(rows, p5):
     return max(pool, key=lambda r: score_of(r, base, p5)) if pool else base
 
 
+SHORT_TAG = {"쌍": "쌍", "삼중": "삼", "핫": "핫", "콜드": "콜", "분산": "분", "겹침": "겹"}
+CORE_SHORT = {"E1": "암호키 상위5 코어", "E2": "암호키 상위5 (조건 없음)", "A1": "인공지능 코어12", "A2": "인공지능 코어12 (조건 없음)",
+              "P1": "25수 풀 (직전 번호 뺌)", "P2": "25수 풀 (안 나온 번호 뺌)", "P3": "25수 풀 (무작위 풀)"}
+
+
+def short_name(r):
+    """표에 넣는 짧은 이름. 필터 전략은 '쌍1~2 핫3~4' 처럼 줄여 쓴다."""
+    if r["kind"] == "F":
+        parts = []
+        for lab, o in zip(LAB, r["opts"]):
+            if o:
+                v = f"{o[0]}" if o[0] == o[1] else f"{o[0]}이상" if o[1] == 99 else f"{o[0]}~{o[1]}"
+                parts.append(SHORT_TAG[lab] + v)
+        return " ".join(parts) if parts else "조건 없음 (무작위)"
+    if r["id"] in CORE_SHORT:
+        return CORE_SHORT[r["id"]]
+    return r["name"].replace(" + 조건", "")
+
+
 def rec_hits(r):
     return sum(r["rec"]["c"]) if r.get("rec") else 0
 
@@ -557,9 +603,9 @@ def show_table(game, rows, key, top=30):
     keys = {"1": ("300회 중 순위 구간 5등 이상 적중률", lambda r: rate(r, "sel")), "2": ("순위 구간 4등 이상 적중률", lambda r: r["sel"][2] / max(r["sel"][0], 1)),
             "3": ("순위 구간 장당 당첨금", lambda r: r["sel"][4] / max(r["sel"][0], 1)),
             "4": ("300회 합산 5등 이상 적중률", lambda r: (r["sel"][1] + r["ver"][1]) / max(r["sel"][0] + r["ver"][0], 1)),
-            "5": ("추천 점수 (300회 합산 5등+률 − 무작위 − 1 표준오차)", lambda r: score_of(r, base, p5) if r is not base else -1),
-            "6": (f"최근 {RECENT}회 당첨 횟수 (5등 이상, 같으면 당첨금)", lambda r: (rec_hits(r), r["rec"]["money"]) if r is not base else (-1, 0)),
-            "7": (f"최근 {RECENT}회 당첨금", lambda r: r["rec"]["money"] if r is not base else -1)}
+            "5": ("추천 점수 (300회 합산 5등+률 - 무작위 - 1 표준오차)", lambda r: score_of(r, base, p5) if r is not base else -1),
+            "6": (f"최근 {RECENT}회 당첨 횟수가 많은 순 (같으면 당첨금)", lambda r: (rec_hits(r), r["rec"]["money"]) if r is not base else (-1, 0)),
+            "7": (f"최근 {RECENT}회 당첨금이 많은 순", lambda r: r["rec"]["money"] if r is not base else -1)}
     title, fn = keys[key]
     best, seen = [], set()
     for r in sorted(rows, key=fn, reverse=True):   # 최근 20회 결과가 똑같은(같은 후보를 고른) 전략은 필터가 가장 단순한 하나만 보여 준다
@@ -573,20 +619,29 @@ def show_table(game, rows, key, top=30):
             break
     money = game.key == "kr"
     star, diamond = recent_best(rows), recommended(rows, p5)
-    print(f"\n  [시뮬레이션 순위] {game.name} · 정렬: {title}")
-    print(f"  ※ 최근 {RECENT}회 = 회차마다 {RECENT_TICKETS}장씩 뽑아 실제 당첨번호로 채점({RECENT * RECENT_TICKETS:,}장) · 300회 = 과거 300회 시뮬레이션(순위 구간 {SPLIT}회 → 검증 구간 {ROUNDS - SPLIT}회)")
-    print(f"  {'ID':>6}  {'전략':<40}| {'당첨':>4}{'5등':>4}{'4등':>4}{'3등':>4}{'1·2등':>6}{'당첨금(원)':>13} | {'300회 5등+률 순위→검증':>22}{'점수':>7}")
-    for r in [base] + best:
+    print(f"\n  ===== 전략 성적표 | {game.name} | {title} =====")
+    print(f"  * '최근 {RECENT}회' = 최근 {RECENT}번의 추첨마다 그 전략으로 {RECENT_TICKETS}장씩({RECENT * RECENT_TICKETS:,}장) 뽑아 실제 당첨번호와 맞춰 본 결과입니다.")
+    print(f"  * 맨 왼쪽 '번호'를 기억했다가 아래 메뉴 1(번호 뽑기)에서 그 번호를 입력하면 됩니다.")
+    print("  " + padl("번호", 4) + "  " + padr("전략(조건)", 30) + "| " + padl("당첨", 4) + padl("5등", 5) + padl("4등", 5) + padl("3등", 5) + padl("1,2등", 6) + padl("당첨금(원)", 12) + " | " + padr("300회(앞/뒤)", 13) + padl("점수", 6))
+    shown = [base] + best
+
+    def line(n_, mark, r):
         rc = r["rec"]["c"] if r.get("rec") else [0] * 5
-        mon = f"{r['rec']['money']:>13,}" if money and r.get("rec") else f"{'-':>13}"
-        sc_ = f"{score_of(r, base, p5) * 100:>+7.2f}" if r is not base else f"{'-':>7}"
-        mark = "★" if r is star else "◆" if r is diamond else " "
-        print(f"  {r['id']:>6}{mark} {r['name'][:39]:<40}| {sum(rc):>4}{rc[4]:>4}{rc[3]:>4}{rc[2]:>4}{rc[0] + rc[1]:>6}{mon} | {rate(r, 'sel'):>10.2%} →{rate(r, 'ver'):>8.2%}{sc_}")
+        mon = f"{r['rec']['money']:,}" if money and r.get("rec") else "-"
+        sc_ = f"{score_of(r, base, p5) * 100:+.2f}" if r is not base else "-"
+        nm = "(비교용) " + short_name(r) if r is base else short_name(r)
+        return ("  " + padl(str(n_), 4) + mark + " " + padr(cut(nm, 30), 30) + "| " + padl(str(sum(rc)), 4) + padl(str(rc[4]), 5) + padl(str(rc[3]), 5) + padl(str(rc[2]), 5) + padl(str(rc[0] + rc[1]), 6)
+                + padl(mon, 12) + " | " + padr(f"{rate(r, 'sel') * 100:.2f}/{rate(r, 'ver') * 100:.2f}", 13) + padl(sc_, 6))
+    for n, r in enumerate(shown):
+        print(line(n, "*" if r is star else "@" if r is diamond else " ", r))
+    for mk, r, how in (("*", star, 2), ("@", diamond, 3)):   # 정렬 때문에 목록에 없는 * · @ 전략도 아래에 보여 준다(메뉴 1 -> 2 또는 3 으로 선택)
+        if r not in shown:
+            print(line("-", mk, r) + f"   (메뉴 1 -> {how} 번으로 선택)")
     exp = RECENT * RECENT_TICKETS * p5
-    print(f"  ★ = 최근 {RECENT}회 당첨 횟수 1위(추천 r) · ◆ = 300회 합산 추천 점수 1위(안정 추천 s). 코어 번호가 6개 미만인 코어 전략은 장끼리 너무 비슷해 추천에서 뺍니다.")
-    print(f"  (무작위로 {RECENT * RECENT_TICKETS:,}장을 뽑으면 5등 이상은 평균 약 {exp:.0f}회" + (", 장당 당첨금(3~5등) 약 220원" if money else ", 뉴욕은 당첨금 자료가 없어 횟수만 표시") +
-          f". {RECENT}회는 표본이 작아 우연의 범위가 크고(표준편차 약 {(exp * (1 - p5)) ** 0.5:.0f}회), 필터 전략의 {RECENT}회 성적은 후보 표본에서 환산한 값입니다)")
-    return best
+    print(f"  * = 최근 {RECENT}회에 가장 많이 당첨된 전략     @ = 300회 동안 안정적이었던 전략(점수가 가장 높은 전략)")
+    print("  이름 읽는 법: 쌍=같이 나온 번호 쌍 수, 삼=세 번호 묶음 수, 핫=자주 나온 번호 수, 콜=안 나온 번호 수, 분=번호가 흩어진 정도, 겹=직전 당첨번호와 겹친 수. '핫3~4'는 3~4개라는 뜻")
+    print(f"  (조건 없이 {RECENT * RECENT_TICKETS:,}장을 뽑아도 평균 약 {exp:.0f}번은 당첨(5등 이상)됩니다. {RECENT}회 성적은 우연의 폭이 커서(약 +-{(exp * (1 - p5)) ** 0.5:.0f}번) 앞으로도 이어진다는 보장은 없습니다)")
+    return shown
 
 
 def show_signals(game):
@@ -611,12 +666,12 @@ def show_signals(game):
 
 
 def show_ciphers(game):
-    print(f"\n  [Enigma 암호키 신뢰도] 직전 회차에서 만든 예측이 다음 회차와 2개 이상 겹친 비율 ({game.name}, 전체 {len(game.draws)}회)")
-    print(f"  {'암호키':<8}{'신뢰도':>8}{'무작위 기대':>12}{'차이 z':>8}")
+    print(f"\n  [암호키 신뢰도] 직전 회차 번호를 암호키로 바꿔 만든 예측이 다음 회차 당첨번호와 2개 이상 겹친 비율 ({game.name}, 전체 {len(game.draws)}회)")
+    print(f"  {'암호키':<6}{'적중률':>8}{'우연 기대':>12}{'차이':>8}")
     for name, (h, t, e) in sorted(cipher_table(game).items(), key=lambda x: -(x[1][0] / max(x[1][1], 1))):
         if t:
             sd = (e * (1 - e / t)) ** 0.5
-            print(f"  {name:<8}{h / t:>8.1%}{e / t:>12.1%}{(h - e) / sd if sd else 0:>8.1f}")
+            print(f"  {CIPHER_KO.get(name, name):<6}{h / t:>8.1%}{e / t:>12.1%}{(h - e) / sd if sd else 0:>8.1f}")
 
 
 # ---------------------------------------------------------------- 번호 뽑기
@@ -648,7 +703,7 @@ def show_tickets(tickets, ctx, core=None):
     for i, t in enumerate(tickets, 1):
         f = feat(t, ctx)
         cc = f"코어 {len(set(t) & set(core))} · " if core else ""
-        print(f"  {i:2d}.  " + "  ".join(f"{n:2d}" for n in t) + f"     {cc}쌍 {f[0]} · 삼중 {f[1]} · 핫 {f[2]} · 콜드 {f[3]} · AC {f[4]} · 겹침 {f[5]} · 합 {sum(t)}")
+        print(f"  {i:2d}.  " + "  ".join(f"{n:2d}" for n in t) + f"     {cc}쌍 {f[0]} · 삼중 {f[1]} · 핫 {f[2]} · 콜드 {f[3]} · 분산 {f[4]} · 겹침 {f[5]} · 합 {sum(t)}")
     print()
 
 
@@ -699,9 +754,9 @@ def check_picks(game):
         return
     base = 36 / game.N
     lines = [f"# 로또 조합 메이커 V{VERSION} 주간 결과 ({game.name})", "", "| 전략 | 장수 | 평균 맞힘 | 5등 이상 | 기대 | 최고 | 당첨금 합 |", "|---|---|---|---|---|---|---|"]
-    print(f"\n  {'전략':<46}{'장수':>5}{'평균':>6}{'5등+':>5}{'기대':>6}{'최고':>5}{'당첨금':>12}")
+    print("\n  " + padr("전략", 44) + padl("장수", 5) + padl("평균맞힘", 9) + padl("5등이상", 8) + padl("기대", 6) + padl("최고", 5) + padl("당첨금(원)", 12))
     for name, e in by.items():
-        print(f"  {name[:44]:<46}{e['n']:>5}{e['hits'] / e['n']:>6.2f}{e['p5']:>5}{e['n'] * p5:>6.1f}{e['best']:>5}{e['money']:>12,}")
+        print("  " + padr(cut(name, 42), 44) + f"{e['n']:>5}{e['hits'] / e['n']:>9.2f}{e['p5']:>8}{e['n'] * p5:>6.1f}{e['best']:>5}{e['money']:>12,}")
         lines.append(f"| {name} | {e['n']} | {e['hits'] / e['n']:.2f} | {e['p5']} | {e['n'] * p5:.1f} | {e['best']} | {e['money']:,} |")
     lines += ["", "## 세부 항목별 평균 맞힌 개수", "| 항목 | 값 | 장수 | 평균 맞힘 |", "|---|---|---|---|"]
     print(f"\n  세부 항목별 평균 맞힘 (무작위 기준 {base:.2f})")
@@ -760,7 +815,7 @@ def pool_input_tickets(game, pool, opts, n, rng, i=None):
 
 
 # ---------------------------------------------------------------- 주간 분석: 지난주 성적 → 부진 전략 정리 → 이번 주 추천 → 누적 기록
-NEW_IN_VERSION = {"P1": "풀(25수) 전략", "P2": "풀(25수) 전략", "P3": "풀(25수) 대조군"}   # 이번 버전에서 보완·추가한 전략
+NEW_IN_VERSION = {"P1": "25수 풀 전략", "P2": "25수 풀 전략", "P3": "25수 풀 비교용"}   # 이번 버전에서 보완·추가한 전략
 
 
 def ledger_path(game):
@@ -838,9 +893,12 @@ def update_status(game, rows, led):
     return changes
 
 
-def summarize_changes(changes):
+def summarize_changes(changes, brief=False):
     """새로 퇴출된 전략이 많을 때 한 줄 요약 + 가장 나쁜 5개만 보여 준다."""
     if not changes:
+        return
+    if brief:
+        print(f"  (성적이 계속 나빴던 전략 {len(changes)}개는 이번에 표에서 뺐습니다)")
         return
     tokens = Counter(t for _, name, _ in changes for t in name.split(" + "))
     print(f"  퇴출: 새로 {len(changes)}개. 가장 많이 겹친 필터: " + ", ".join(f"{t}({c}개)" for t, c in tokens.most_common(4)))
@@ -959,53 +1017,121 @@ def ask(msg, default):
     return s or str(default)
 
 
-def pick_numbers(game, rows, best):
-    by_id = {r["id"].upper(): r for r in rows}
-    print("\n  전략을 고르세요.  [ID] 순위표의 ID (예: F12, E1, A1)   [r] 추천(★ 최근 20회 당첨 1위)   [s] 안정 추천(◆)   [c] 직접 필터 만들기   [p] 받아 온 25수 풀 안에서 고르기")
-    ch = ask("선택", "r")
-    if ch.lower() == "p":
-        nums = [int(x) for x in input(f"  풀 번호를 쉼표나 띄어쓰기로 입력 ({pool_size(game)}개 권장): ").replace(",", " ").split()]
-        if len(set(nums)) < 6 or any(not 1 <= x <= game.N for x in nums):
-            print("  1~%d 사이 서로 다른 번호 6개 이상을 입력해 주세요." % game.N)
+def ask_int(msg, default, lo=None, hi=None):
+    """숫자 하나를 입력받는다. 그냥 엔터면 [ ] 안의 기본값. 숫자가 아니거나 범위를 벗어나면 다시 묻는다."""
+    while True:
+        t = input(f"  {msg} [{default}]: ").strip()
+        if not t:
+            return default
+        try:
+            v = int(t)
+        except ValueError:
+            print("  숫자만 입력해 주세요. (예: 3)")
+            continue
+        if (lo is not None and v < lo) or (hi is not None and v > hi):
+            print(f"  {lo}부터 {hi}까지의 숫자를 입력해 주세요.")
+            continue
+        return v
+
+
+def ask_nums(msg, lo, hi):
+    """번호 여러 개를 띄어쓰기(또는 쉼표)로 입력받는다. 그냥 엔터면 빈 목록."""
+    while True:
+        t = input(f"  {msg}: ").replace(",", " ").strip()
+        if not t:
+            return []
+        try:
+            v = [int(x) for x in t.split()]
+        except ValueError:
+            print("  숫자만 입력해 주세요. (예: 7 14 21)")
+            continue
+        if any(x < lo or x > hi for x in v):
+            print(f"  {lo}부터 {hi}까지의 번호만 쓸 수 있습니다.")
+            continue
+        return sorted(set(v))
+
+
+RANGE_HINT = {"쌍": "직전 10회에 함께 나온 두 번호 쌍이 몇 개 들어가게 할지", "삼중": "직전 10회에 함께 나온 세 번호 묶음이 몇 개", "핫": "직전 10회에 2번 이상 나온 번호가 몇 개",
+              "콜드": "직전 10회에 한 번도 안 나온 번호가 몇 개", "분산": "번호 사이 차이가 얼마나 다양한지(높을수록 고르게 흩어짐)", "겹침": "직전 당첨번호와 겹치는 번호가 몇 개"}
+
+
+def ask_range(name):
+    while True:
+        t = input(f"  [{name}] {RANGE_HINT[name]}\n     '최소 최대' 두 숫자 (예: 0 1) 상관없으면 그냥 엔터: ").replace(",", " ").strip()
+        if not t:
+            return None
+        try:
+            v = [int(x) for x in t.split()]
+        except ValueError:
+            print("  숫자만 입력해 주세요.")
+            continue
+        if len(v) == 1:
+            v = [v[0], v[0]]
+        if len(v) != 2 or v[0] > v[1]:
+            print("  작은 숫자, 큰 숫자 순서로 두 개를 입력해 주세요. (예: 0 1)")
+            continue
+        return v
+
+
+def pick_numbers(game, rows, shown):
+    p5 = p5_of(game.N)
+    print("\n  ------ 어떤 방법으로 번호를 고를까요? ------")
+    print("   1  표에서 마음에 드는 전략의 '번호'를 골라서   (가장 많이 씁니다)")
+    print("   2  * 표시(최근 20회에 가장 많이 당첨된) 전략으로 자동으로")
+    print("   3  @ 표시(300회 동안 안정적이었던) 전략으로 자동으로")
+    print("   4  조건(쌍, 핫, 콜드 등)을 내가 직접 정해서")
+    print("   5  다른 곳에서 받은 25개 번호 안에서만 고르기")
+    print("   0  돌아가기")
+    ch = ask_int("선택", 1, 0, 5)
+    if ch == 0:
+        return
+    nxt = game.draws[-1][0] + 1
+    if ch == 5:
+        nums = ask_nums(f"받은 번호를 띄어서 입력 (6개 이상, 보통 {pool_size(game)}개)", 1, game.N)
+        if len(nums) < 6:
+            print("  번호가 6개 이상 필요합니다.")
             return
-        sid = ask("함께 쓸 필터 전략 ID (없으면 엔터)", "")
+        k = ask_int("함께 쓸 전략의 표 번호 (쓰지 않으면 0)", 0, 0, len(shown) - 1)
         opts = None
-        if sid and sid.upper() in by_id and by_id[sid.upper()]["kind"] == "F":
-            opts = [tuple(o) if o else None for o in by_id[sid.upper()]["opts"]]
-        n = int(ask("몇 장", 5))
+        if k and shown[k]["kind"] == "F":
+            opts = [tuple(o) if o else None for o in shown[k]["opts"]]
+        n = ask_int("몇 장을 뽑을까요? (1장 = 1,000원)", 5, 1, 50)
         tickets, ctx = pool_input_tickets(game, set(nums), opts, n, random.Random())
-        print(f"\n  입력한 풀 {len(set(nums))}개 · 조합 {comb(len(set(nums)), 6):,}개 (전체 {comb(game.N, 6):,}개의 {comb(len(set(nums)), 6) / comb(game.N, 6):.2%}) · {game.draws[-1][0] + 1}회용")
+        print(f"\n  입력한 번호 {len(nums)}개 · 만들 수 있는 조합 {comb(len(nums), 6):,}개 (전체 {comb(game.N, 6):,}개의 {comb(len(nums), 6) / comb(game.N, 6):.2%}) · {nxt}회용")
         show_tickets(tickets, ctx)
-        print(f"  풀 안에서 고른 장도 장당 1등 확률은 1/{comb(game.N, 6):,} 로 같고, 이번 당첨번호 6개가 모두 풀 안에 있을 확률만 {comb(len(set(nums)), 6) / comb(game.N, 6):.2%} 입니다.")
-        if tickets and ask("이 번호를 저장할까요? (y/n)", "y").lower() == "y":
-            save_picks(game, game.draws[-1][0] + 1, "POOL", f"입력 풀 {len(set(nums))}수" + (f" + {sid.upper()}" if opts else ""), tickets)
+        print(f"  ※ 번호를 줄여서 골라도 한 장이 1등이 될 확률은 1/{comb(game.N, 6):,} 로 같습니다. 이번 당첨번호 6개가 모두 이 안에 있을 확률만 {comb(len(nums), 6) / comb(game.N, 6):.2%} 입니다.")
+        if tickets and ask_int("이 번호를 저장할까요?   1=저장   2=저장 안 함", 1, 1, 2) == 1:
+            save_picks(game, nxt, "POOL", f"받은 번호 {len(nums)}개 안에서" + (f" + {shown[k]['name']}" if opts else ""), tickets)
             print("  저장했습니다.")
         return
-    if ch.lower() == "c":
-        def rng_in(name):
-            s = input(f"  {name} 범위 (예: 0-1, 없으면 엔터): ").strip()
-            if not s:
-                return None
-            a, _, b = s.partition("-")
-            return [int(a), int(b or a)]
-        opts = [rng_in(n) for n in LAB]
-        row = {"id": "C", "kind": "F", "opts": opts, "name": "직접 선택: " + (" + ".join(x for x in [tag(n, tuple(o) if o else None) for n, o in zip(LAB, opts)] if x) or "필터 없음")}
+    if ch == 4:
+        print("\n  조건을 직접 정합니다. 모르면 모두 그냥 엔터를 누르세요(조건 없이 무작위).")
+        opts = [ask_range(n_) for n_ in LAB]
+        row = {"id": "C", "kind": "F", "opts": opts, "name": "직접 정함: " + (" + ".join(x for x in [tag(n_, tuple(o) if o else None) for n_, o in zip(LAB, opts)] if x) or "조건 없음")}
+    elif ch == 2:
+        row = recent_best(rows)
+    elif ch == 3:
+        row = recommended(rows, p5)
     else:
-        row = recent_best(rows) if ch.lower() == "r" else recommended(rows, p5_of(game.N)) if ch.lower() == "s" else by_id.get(ch.upper())
-        if not row:
-            print("  순위표에 없는 ID 입니다.")
-            return
-    n = int(ask("몇 장", 5))
-    fixed = tuple(int(x) for x in ask("꼭 넣을 번호(쉼표, 없으면 엔터)", "").replace(" ", "").split(",") if x)
-    banned = tuple(int(x) for x in ask("빼고 싶은 번호(쉼표, 없으면 엔터)", "").replace(" ", "").split(",") if x)
-    tickets, ctx, core = make_tickets(game, row, n, random.Random(), fixed, banned)
-    print(f"\n  전략 {row['id']}: {row['name']}  ({game.draws[-1][0] + 1}회용)")
+        k = ask_int(f"표의 번호 (1~{len(shown) - 1}, 0은 비교용 무작위)", 1, 0, len(shown) - 1)
+        row = shown[k]
+    n = ask_int("몇 장을 뽑을까요? (1장 = 1,000원)", 5, 1, 50)
+    fixed = ask_nums(f"꼭 넣고 싶은 번호 (띄어서 입력, 없으면 그냥 엔터)", 1, game.N)
+    banned = ask_nums(f"빼고 싶은 번호 (띄어서 입력, 없으면 그냥 엔터)", 1, game.N)
+    if len(fixed) > 5:
+        print("  꼭 넣을 번호는 5개까지만 가능합니다. 앞의 5개만 사용합니다.")
+        fixed = fixed[:5]
+    fixed = tuple(x for x in fixed if x not in banned)
+    tickets, ctx, core = make_tickets(game, row, n, random.Random(), tuple(fixed), tuple(banned))
+    print(f"\n  선택한 전략: {row['name']}  ({nxt}회용)")
     show_tickets(tickets, ctx, core)
     if tickets:
-        print(f"  {len(tickets)}장이 모두 1등일 확률: 장당 1/{comb(game.N, 6):,} → 합계 약 {len(tickets) / comb(game.N, 6):.7%}")
-        if ask("이 번호를 저장할까요? (y/n)", "y").lower() == "y":
-            save_picks(game, game.draws[-1][0] + 1, row["id"], row["name"], tickets)
-            print("  저장했습니다. 추첨 뒤 [3] → [4] 로 결과를 확인하세요.")
+        print(f"  ※ 어떤 번호든 한 장이 1등이 될 확률은 1/{comb(game.N, 6):,} 로 같습니다.")
+        if ask_int("이 번호를 저장할까요?   1=저장   2=저장 안 함", 1, 1, 2) == 1:
+            save_picks(game, nxt, row["id"], row["name"], tickets)
+            print("  저장했습니다. 추첨이 끝난 뒤 메뉴 3(당첨번호 받기) → 메뉴 4(결과 보기)를 누르세요.")
+    else:
+        print("  조건에 맞는 번호를 만들지 못했습니다. 꼭 넣을 번호나 조건을 줄여 보세요.")
 
 
 def main():
@@ -1014,7 +1140,8 @@ def main():
     if any(a in sys.argv for a in ("--game", "--update", "--check", "--weekly", "--pool")):
         key = "ny" if "ny" in sys.argv else "kr"
     else:
-        key = {"1": "kr", "2": "ny"}.get(ask("게임  1=한국 6/45  2=뉴욕 6/59", 1), "kr")
+        print("\n  어느 나라 로또를 볼까요?\n   1  한국 로또 6/45 (동행복권)\n   2  뉴욕 로또 6/59")
+        key = {1: "kr", 2: "ny"}[ask_int("선택", 1, 1, 2)]
     game = Game(key)
     if len(game.draws) < 500:
         print(f"  {game.name} 당첨번호를 내려받습니다" + (" (한국은 처음에 몇 분 걸립니다)." if key == "kr" else "."))
@@ -1037,42 +1164,52 @@ def main():
         pool_report(game)
         return
     led = load_ledger(game)
-    summarize_changes(update_status(game, all_rows, led))
+    summarize_changes(update_status(game, all_rows, led), brief=True)
     save_ledger(game, led)
     rows = active_rows(game, all_rows, led)
-    if len(rows) < len(all_rows):
-        print(f"  (퇴출된 전략 {len(led['status'])}개는 순위표에서 숨김. 목록은 ledger_{game.key}.json)")
-    show_ciphers(game)
+    print("  ※ 사용법: 숫자를 입력하고 엔터(Enter) 키를 누르세요. 그냥 엔터만 누르면 [ ] 안의 숫자가 선택됩니다.")
     key_sort = "6"
-    best = show_table(game, rows, key_sort)
+    shown = show_table(game, rows, key_sort)
     while True:
-        print("\n  [1] 번호 뽑기   [2] 순위표 기준   [3] 최신 당첨번호 받기   [4] 저장한 번호 결과   [5] 암호키 신뢰도   [6] 신호 분석   [7] 주간 분석(금요일)   [8] 25수 풀 분석   [0] 끝내기")
-        m = ask("메뉴", 1)
-        if m == "0":
+        print("\n  ------ 무엇을 할까요? ------")
+        print("   1  번호 뽑기")
+        print("   2  성적표 다시 보기 (정렬 기준 바꾸기)")
+        print("   3  최신 당첨번호 받기 (추첨한 다음 날 한 번)")
+        print("   4  내가 뽑아 둔 번호의 당첨 결과 보기")
+        print("   5  더 자세한 분석 (암호키, 신호, 주간 분석, 25수 풀)")
+        print("   0  끝내기")
+        m = ask_int("메뉴", 1, 0, 5)
+        if m == 0:
             break
-        if m == "1":
-            pick_numbers(game, rows, best)
-        elif m == "2":
-            key_sort = ask("기준  1=5등 이상 적중률  2=4등 이상  3=장당 당첨금  4=전체 300회 합산  5=추천 점수  6=최근 20회 당첨 횟수  7=최근 20회 당첨금", key_sort)
-            best = show_table(game, rows, key_sort if key_sort in "1234567" else "6")
-        elif m == "3":
+        if m == 1:
+            pick_numbers(game, rows, shown)
+        elif m == 2:
+            print("\n  어떤 순서로 볼까요?")
+            print("   1  최근 20회 당첨 횟수가 많은 순 (기본)")
+            print("   2  최근 20회 당첨금이 많은 순")
+            print("   3  300회 합산 성적순")
+            print("   4  추천 점수순")
+            k = ask_int("선택", 1, 1, 4)
+            key_sort = {1: "6", 2: "7", 3: "4", 4: "5"}[k]
+            shown = show_table(game, rows, key_sort)
+        elif m == 3:
             game.update()
             all_rows = build_table(game)
             rows = active_rows(game, all_rows, load_ledger(game))
-            best = show_table(game, rows, key_sort)
-        elif m == "7":
-            weekly(game, all_rows)
-        elif m == "8":
-            pool_report(game)
-        elif m == "4":
+            shown = show_table(game, rows, key_sort)
+        elif m == 4:
             check_picks(game)
-        elif m == "5":
-            show_ciphers(game)
-        elif m == "6":
-            show_signals(game)
-        else:
-            print("  메뉴 번호를 입력해 주세요.")
-
+        elif m == 5:
+            print("\n  1  암호키 신뢰도    2  신호 분석    3  주간 분석 (금요일에 한 번)    4  25수 풀 분석    0  돌아가기")
+            k = ask_int("선택", 0, 0, 4)
+            if k == 1:
+                show_ciphers(game)
+            elif k == 2:
+                show_signals(game)
+            elif k == 3:
+                weekly(game, all_rows)
+            elif k == 4:
+                pool_report(game)
 
 if __name__ == "__main__":
     try:
